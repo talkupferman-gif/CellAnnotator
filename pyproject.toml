@@ -1,0 +1,35 @@
+[project]
+name = "cellannotator"
+version = "0.1.0"
+description = "Desktop app for hand annotation of cell images, with shared project commits."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pillow",
+    "scipy",
+    "tifffile",
+    "PySide6",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "python-multipart",
+]
+
+[project.optional-dependencies]
+segment = ["cellpose"]
+dev = ["pytest"]
+
+[project.scripts]
+cellannotator = "cellannotator.__main__:main"
+cellannotator-server = "cellannotator.server.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["cellannotator*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
