@@ -55,8 +55,12 @@ class SyncClient:
     def list_projects(self) -> list[dict]:
         return self._request("GET", "/projects").json()
 
-    def create_project(self, name: str, kind: str, manifest: dict) -> dict:
-        return self._request("POST", "/projects", json={"name": name, "kind": kind, "manifest": manifest}).json()
+    def create_project(self, name: str, kind: str, manifest: dict, description: str = "") -> dict:
+        return self._request(
+            "POST",
+            "/projects",
+            json={"name": name, "kind": kind, "manifest": manifest, "description": description},
+        ).json()
 
     def get_project(self, project_id: str) -> dict:
         return self._request("GET", f"/projects/{project_id}").json()
@@ -64,8 +68,30 @@ class SyncClient:
     def update_manifest(self, project_id: str, manifest: dict) -> dict:
         return self._request("POST", f"/projects/{project_id}/manifest", json={"manifest": manifest}).json()
 
-    def invite(self, project_id: str, email: str) -> dict:
-        return self._request("POST", f"/projects/{project_id}/invites", json={"email": email}).json()
+    def invite(self, project_id: str, email: str, role: str = "helper") -> dict:
+        return self._request(
+            "POST", f"/projects/{project_id}/invites", json={"email": email, "role": role}
+        ).json()
+
+    def set_description(self, project_id: str, description: str) -> dict:
+        return self._request(
+            "POST", f"/projects/{project_id}/description", json={"description": description}
+        ).json()
+
+    def set_locked(self, project_id: str, locked: bool) -> dict:
+        return self._request("POST", f"/projects/{project_id}/lock", json={"locked": locked}).json()
+
+    def changes(self, project_id: str) -> list[dict]:
+        return self._request("GET", f"/projects/{project_id}/changes").json()
+
+    def list_branches(self, project_id: str) -> list[dict]:
+        return self._request("GET", f"/projects/{project_id}/branches").json()
+
+    def discard_branch(self, project_id: str, branch_id: str) -> dict:
+        return self._request("DELETE", f"/projects/{project_id}/branches/{branch_id}").json()
+
+    def branch_archive(self, project_id: str, branch_id: str) -> bytes:
+        return self._request("GET", f"/projects/{project_id}/branches/{branch_id}/archive").content
 
     def list_commits(self, project_id: str) -> list[dict]:
         return self._request("GET", f"/projects/{project_id}/commits").json()

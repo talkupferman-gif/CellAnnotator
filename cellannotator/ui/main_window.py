@@ -4,31 +4,36 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
+    QDialog,
+    QDockWidget,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSlider,
     QSpinBox,
-    QSplitter,
+    QStackedWidget,
+    QToolBar,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from cellannotator.images import display_rgb, for_model, page_count
+from cellannotator.images import default_layer_colors, page_count, render_display, split_layers
+from cellannotator.local_server import ensure_local_server
 from cellannotator.masks import delete_labels, merge_labels, split_label
 from cellannotator.meta import load_meta, meta_paths
 from cellannotator.project import Project
 from cellannotator.segment import ModelRunner
+from cellannotator.segio import seg_pair
 from cellannotator.settings import Settings
 from cellannotator.sync_client import SyncClient, SyncError
 from cellannotator.ui.canvas import Canvas
@@ -38,11 +43,14 @@ from cellannotator.ui.dialogs import (
     HistoryDialog,
     LoginDialog,
     ProjectListDialog,
+    LayerColorDialog,
     ask_kind,
+    confirm,
     info,
     read_zip,
     warn,
 )
+from cellannotator.ui.home import DetailPage, HomePage
 from cellannotator.zstack import fill_links
 
 
@@ -67,7 +75,7 @@ class ModelThread(QThread):
                 break
             try:
                 masks = runner.run(
-                    for_model(image),
+                    image,
                     model_name=self.model_name,
                     weights=self.weights,
                     diameter=self.diameter,
@@ -86,6 +94,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CellAnnotator")
         self.resize(1400, 900)
         self.settings = Settings.load()
+        ensure_local_server(self.settings.server_url)
         self.project: Project | None = None
         self.current_rel: str | None = None
         self.active_link_id: str | None = None
@@ -93,122 +102,162 @@ class MainWindow(QMainWindow):
         self.weights_path: str | None = None
         self._thread: ModelThread | None = None
         self._showing_score = False
+        self._asked_login = False
+        self.member_role: str | None = None
+        self._remote: dict | None = None
         self._build()
         self._account_label()
+        self._show_home()
 
     def _build(self) -> None:
         self.canvas = Canvas()
         self.canvas.edited.connect(self._on_edited)
         self.canvas.labelsTouched.connect(self._on_labels)
         self.canvas.status.connect(self.statusBar().showMessage)
+        self.setStyleSheet(_STYLE)
+        self._build_model_dialog()
+        self._build_image_dock()
+        self._build_menus()
+        self._build_toolbar()
 
-        file_row = QHBoxLayout()
-        for text, slot in (
-            ("Open folder", self.open_folder),
-            ("Open shared", self.open_shared),
-            ("Save", self.save),
-            ("Publish", self.publish),
-            ("Commit", self.commit),
-            ("Pull", self.pull),
-            ("History", self.show_history),
-            ("Invite", self.invite),
-            ("Log in", self.login),
-        ):
-            button = QPushButton(text)
-            button.clicked.connect(slot)
-            file_row.addWidget(button)
-        file_row.addStretch(1)
-        self.account = QLabel("Not logged in")
-        file_row.addWidget(self.account)
+        hint = QLabel(
+            "Right-click and close the loop. Draw fills a cell. Erase cuts inside the loop. "
+            "X shows the image alone. Z shows outlines. The menu has images, ranking, colors, models, and versions."
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.canvas, 1)
+        layout.addWidget(hint)
+        self.work = QWidget()
+        self.work.setLayout(layout)
+        self.home = HomePage()
+        self.home.signIn.connect(self.login)
+        self.home.chosen.connect(self._show_project)
+        self.detail = DetailPage()
+        self.detail.back.connect(self._show_home)
+        self.detail.openProject.connect(self._open_from_detail)
+        self.detail.saveDescription.connect(self._save_description)
+        self.detail.toggleLock.connect(self._toggle_lock)
+        self.detail.invite.connect(self._invite_from_detail)
+        self.detail.showChanges.connect(self._show_changes)
+        self.detail.loadBranch.connect(self._load_branch)
+        self.detail.discardBranch.connect(self._discard_branch)
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self.home)
+        self.pages.addWidget(self.detail)
+        self.pages.addWidget(self.work)
+        self.setCentralWidget(self.pages)
+        self.statusBar().showMessage("Sign in to see your projects")
 
-        tool_row = QHBoxLayout()
+    def _build_toolbar(self) -> None:
         self.draw_button = QToolButton()
         self.draw_button.setText("Draw")
         self.draw_button.setCheckable(True)
         self.draw_button.setChecked(True)
         self.erase_button = QToolButton()
         self.erase_button.setText("Erase")
+        self.erase_button.setObjectName("erase")
         self.erase_button.setCheckable(True)
-        group = QButtonGroup(self)
-        group.setExclusive(True)
-        group.addButton(self.draw_button)
-        group.addButton(self.erase_button)
+        modes = QButtonGroup(self)
+        modes.setExclusive(True)
+        modes.addButton(self.draw_button)
+        modes.addButton(self.erase_button)
         self.draw_button.clicked.connect(lambda: self.canvas.set_mode("draw"))
         self.erase_button.clicked.connect(lambda: self.canvas.set_mode("erase"))
-        tool_row.addWidget(self.draw_button)
-        tool_row.addWidget(self.erase_button)
-        tool_row.addWidget(QLabel("Brush"))
-        self.brush = QSlider(Qt.Horizontal)
-        self.brush.setRange(1, 80)
-        self.brush.setValue(8)
-        self.brush.setFixedWidth(120)
-        self.brush.valueChanged.connect(self._set_brush)
-        tool_row.addWidget(self.brush)
-        for text, slot in (
-            ("Merge", self.merge),
-            ("Split", self.split_cells),
-            ("Delete", self.delete_selected),
-            ("Same cell", self.same_cell),
-            ("Finish linking", self.finish_linking),
-            ("Fill", self.fill),
-            ("Fit", self.canvas.fit),
+        bar = QToolBar("Annotate")
+        bar.setObjectName("annotate")
+        bar.setMovable(False)
+        bar.setFloatable(False)
+        for widget in (
+            self.draw_button,
+            self.erase_button,
+            _action("Merge", self.merge),
+            _action("Delete", self.delete_selected),
+            _action("Go back", self.undo),
+            _action("Redo", self.redo),
         ):
-            button = QPushButton(text)
-            button.clicked.connect(slot)
-            tool_row.addWidget(button)
-            if text in {"Same cell", "Finish linking", "Fill"}:
-                button.setObjectName(text)
-        tool_row.addStretch(1)
+            bar.addWidget(widget)
+        self.addToolBar(bar)
+        bar.hide()
+        self.toolbar = bar
 
-        model_row = QHBoxLayout()
-        self.model = QComboBox()
-        self.model.addItems(["cyto3", "nuclei", "Custom weights"])
-        self.weights_button = QPushButton("Weights file")
-        self.weights_button.clicked.connect(self.pick_weights)
-        self.auto_diameter = QPushButton("Auto diameter")
-        self.auto_diameter.setCheckable(True)
-        self.auto_diameter.setChecked(True)
-        self.diameter = QSpinBox()
-        self.diameter.setRange(1, 2000)
-        self.diameter.setValue(30)
-        self.diameter.setEnabled(False)
-        self.auto_diameter.toggled.connect(lambda on: self.diameter.setEnabled(not on))
-        self.cyto = QSpinBox()
-        self.nucleus = QSpinBox()
-        for box in (self.cyto, self.nucleus):
-            box.setRange(0, 3)
-        model_row.addWidget(QLabel("Model"))
-        model_row.addWidget(self.model)
-        model_row.addWidget(self.weights_button)
-        model_row.addWidget(self.auto_diameter)
-        model_row.addWidget(self.diameter)
-        model_row.addWidget(QLabel("Cyto"))
-        model_row.addWidget(self.cyto)
-        model_row.addWidget(QLabel("Nucleus"))
-        model_row.addWidget(self.nucleus)
-        run = QPushButton("Run")
-        run.clicked.connect(self.run_current)
-        batch = QPushButton("Run batch")
-        batch.clicked.connect(self.run_batch)
-        model_row.addWidget(run)
-        model_row.addWidget(batch)
-        self.channel = QComboBox()
-        for label, data in (("Gray", "gray"), ("Red", "r"), ("Green", "g"), ("Blue", "b")):
-            self.channel.addItem(label, data)
-        self.channel.currentIndexChanged.connect(self._change_channel)
-        model_row.addWidget(self.channel)
-        self.fill_toggle = QPushButton("Mask fill")
-        self.fill_toggle.setCheckable(True)
-        self.fill_toggle.setChecked(True)
-        self.outline_toggle = QPushButton("Borders")
-        self.outline_toggle.setCheckable(True)
-        self.outline_toggle.setChecked(True)
-        self.fill_toggle.toggled.connect(self._toggle_fill)
-        self.outline_toggle.toggled.connect(self._toggle_outlines)
-        model_row.addWidget(self.fill_toggle)
-        model_row.addWidget(self.outline_toggle)
-        model_row.addStretch(1)
+    def _build_menus(self) -> None:
+        menu = self.menuBar()
+        file_menu = menu.addMenu("File")
+        file_menu.addAction("My projects", self._show_home)
+        file_menu.addAction("Open folder", self.open_folder)
+        save_action = file_menu.addAction("Save", self.save)
+        save_action.setShortcut(QKeySequence.Save)
+        file_menu.addAction("Open shared", self.open_shared)
 
+        account = menu.addMenu("Account")
+        self.account_action = account.addAction("Not logged in")
+        self.account_action.setEnabled(False)
+        account.addSeparator()
+        account.addAction("Sign in", self.login)
+
+        version = menu.addMenu("Version")
+        version.addAction("Publish", self.publish)
+        version.addAction("Commit", self.commit)
+        version.addAction("Pull", self.pull)
+        version.addAction("History", self.show_history)
+        version.addAction("Invite", self.invite)
+
+        image = menu.addMenu("Image")
+        self.images_action = image.addAction("Images and ranking")
+        self.images_action.setCheckable(True)
+        self.images_action.setChecked(False)
+        self.images_action.toggled.connect(self.images_dock.setVisible)
+        image.addAction("Layer colors", self.edit_layer_colors)
+        image.addAction("Fit", self.canvas.fit)
+        channel_menu = image.addMenu("Channel")
+        channel_group = QActionGroup(self)
+        channel_group.setExclusive(True)
+        self.channel_actions = {}
+        for label, data in (("Layers", "layers"), ("Gray", "gray"), ("Red", "r"), ("Green", "g"), ("Blue", "b")):
+            action = channel_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(data)
+            action.setChecked(data == "layers")
+            channel_group.addAction(action)
+            self.channel_actions[data] = action
+        channel_group.triggered.connect(self._change_channel)
+
+        model_menu = menu.addMenu("Model")
+        model_menu.addAction("Run model…", self.show_model_dialog)
+        model_menu.addAction("Run on this image", self.run_current)
+        model_menu.addAction("Run batch", self.run_batch)
+
+        view = menu.addMenu("View")
+        self.masks_action = view.addAction("Masks")
+        self.masks_action.setCheckable(True)
+        self.masks_action.setChecked(True)
+        self.masks_action.setShortcut(QKeySequence("X"))
+        self.masks_action.toggled.connect(self._set_masks_visible)
+        self.outlines_action = view.addAction("Outlines")
+        self.outlines_action.setCheckable(True)
+        self.outlines_action.setChecked(False)
+        self.outlines_action.setShortcut(QKeySequence("Z"))
+        self.outlines_action.toggled.connect(self._set_outlines)
+        self.fill_action_view = view.addAction("Mask fill")
+        self.fill_action_view.setCheckable(True)
+        self.fill_action_view.setChecked(True)
+        self.fill_action_view.toggled.connect(self._set_fill)
+
+        cells = menu.addMenu("Cells")
+        cells.addAction("Split", self.split_cells)
+        self.same_cell_action = cells.addAction("Same cell", self.same_cell)
+        self.finish_action = cells.addAction("Finish linking", self.finish_linking)
+        self.fill_action = cells.addAction("Fill", self.fill)
+        undo_action = cells.addAction("Go back", self.undo)
+        undo_action.setShortcut(QKeySequence.Undo)
+        redo_action = cells.addAction("Redo", self.redo)
+        redo_action.setShortcut(QKeySequence.Redo)
+
+    def _build_image_dock(self) -> None:
         self.list = QListWidget()
         self.list.currentItemChanged.connect(self._on_list)
         self.score = QComboBox()
@@ -222,67 +271,372 @@ class MainWindow(QMainWindow):
         self.link_label = QLabel("No cell link in progress")
         self.link_label.setWordWrap(True)
         side = QVBoxLayout()
-        side.addWidget(QLabel("Images"))
+        side.setContentsMargins(12, 12, 12, 12)
+        side.setSpacing(8)
+        title = QLabel("Images")
+        title.setObjectName("section")
+        side.addWidget(title)
         side.addWidget(self.list, 1)
-        side.addWidget(QLabel("Ready (1 needs work, 10 is done)"))
+        side.addWidget(QLabel("Ready: 1 needs work, 10 is done"))
         side.addWidget(self.score)
         side.addWidget(QLabel("Sort"))
         side.addWidget(self.sort)
         side.addWidget(self.link_label)
         side_widget = QWidget()
+        side_widget.setObjectName("side")
         side_widget.setLayout(side)
-        side_widget.setMinimumWidth(280)
+        self.images_dock = QDockWidget("Images", self)
+        self.images_dock.setMinimumWidth(280)
+        self.images_dock.setWidget(side_widget)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.images_dock)
+        self.images_dock.hide()
+        self.images_dock.visibilityChanged.connect(self._sync_images_action)
 
-        splitter = QSplitter()
-        splitter.addWidget(side_widget)
-        splitter.addWidget(self.canvas)
-        splitter.setStretchFactor(1, 1)
-
-        hint = QLabel(
-            "Right-click, then move the pointer. Draw becomes a cell when you return to the start. "
-            "Erase rubs pixels out along that same path; right-click again to stop. "
-            "Left-drag moves the image. The wheel zooms. Shift-click adds to the selection. "
-            "Escape cancels a draw."
+    def _build_model_dialog(self) -> None:
+        self.model_dialog = QDialog(self)
+        self.model_dialog.setWindowTitle("Run model")
+        self.model_dialog.setMinimumWidth(420)
+        self.model = QComboBox()
+        self.model.addItems(["cyto3", "nuclei", "Custom weights"])
+        self.weights_button = QPushButton("Weights file")
+        self.weights_button.clicked.connect(self.pick_weights)
+        self.weights_name = QLabel("No weights file")
+        self.weights_name.setObjectName("hint")
+        self.auto_diameter = QPushButton("Auto size")
+        self.auto_diameter.setCheckable(True)
+        self.auto_diameter.setChecked(True)
+        self.diameter = QSpinBox()
+        self.diameter.setRange(1, 2000)
+        self.diameter.setValue(30)
+        self.diameter.setEnabled(False)
+        self.auto_diameter.toggled.connect(lambda on: self.diameter.setEnabled(not on))
+        self.cyto = QSpinBox()
+        self.nucleus = QSpinBox()
+        for box in (self.cyto, self.nucleus):
+            box.setRange(0, 16)
+        note = QLabel(
+            "cyto3 and nuclei are the built-in models. "
+            "For one of your own, choose Custom weights and pick the file. "
+            "Layer numbers are the Cellpose channels: 0 is gray, 1 is the first layer."
         )
-        hint.setWordWrap(True)
+        note.setWordWrap(True)
+        run = QPushButton("Run on this image")
+        run.setObjectName("primary")
+        run.clicked.connect(self.run_current)
+        batch = QPushButton("Run batch")
+        batch.clicked.connect(self.run_batch)
+        form = QVBoxLayout(self.model_dialog)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(8)
+        form.addWidget(note)
+        form.addWidget(QLabel("Model"))
+        form.addWidget(self.model)
+        form.addWidget(self.weights_button)
+        form.addWidget(self.weights_name)
+        row = QHBoxLayout()
+        row.addWidget(self.auto_diameter)
+        row.addWidget(self.diameter)
+        form.addLayout(row)
+        channels = QHBoxLayout()
+        channels.addWidget(QLabel("Layer"))
+        channels.addWidget(self.cyto)
+        channels.addWidget(QLabel("Second layer"))
+        channels.addWidget(self.nucleus)
+        form.addLayout(channels)
+        buttons = QHBoxLayout()
+        buttons.addWidget(run)
+        buttons.addWidget(batch)
+        form.addLayout(buttons)
+        self.channel = QComboBox()
+        for label, data in (("Layers", "layers"), ("Gray", "gray"), ("Red", "r"), ("Green", "g"), ("Blue", "b")):
+            self.channel.addItem(label, data)
 
-        layout = QVBoxLayout()
-        layout.addLayout(file_row)
-        layout.addLayout(tool_row)
-        layout.addLayout(model_row)
-        layout.addWidget(splitter, 1)
-        layout.addWidget(hint)
-        central = QWidget()
-        central.setLayout(layout)
-        self.setCentralWidget(central)
-        self.statusBar().showMessage("Open a folder of images")
+    def show_model_dialog(self) -> None:
+        self.model_dialog.show()
+        self.model_dialog.raise_()
+        self.model_dialog.activateWindow()
 
-        save_action = QAction(self)
-        save_action.setShortcut(QKeySequence.Save)
-        save_action.triggered.connect(self.save)
-        self.addAction(save_action)
-        undo_action = QAction(self)
-        undo_action.setShortcut(QKeySequence.Undo)
-        undo_action.triggered.connect(self.undo)
-        self.addAction(undo_action)
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
 
-    def _set_brush(self, value: int) -> None:
-        self.canvas.brush_radius = value
-        self.statusBar().showMessage(f"Brush {value}px")
+    def _sync_images_action(self, visible: bool) -> None:
+        if not hasattr(self, "images_action"):
+            return
+        self.images_action.blockSignals(True)
+        self.images_action.setChecked(visible)
+        self.images_action.blockSignals(False)
 
-    def _toggle_fill(self, on: bool) -> None:
-        self.canvas.show_fill = on
+    def _set_masks_visible(self, on: bool) -> None:
+        self.canvas.masks_visible = on
         self.canvas.refresh()
+        self.statusBar().showMessage("Image only" if not on else "Masks on")
 
-    def _toggle_outlines(self, on: bool) -> None:
+    def _set_outlines(self, on: bool) -> None:
         self.canvas.show_outlines = on
+        self.canvas.refresh()
+        self.statusBar().showMessage("Outlines on" if on else "Fill only")
+
+    def _set_fill(self, on: bool) -> None:
+        self.canvas.show_fill = on
         self.canvas.refresh()
 
     def _account_label(self) -> None:
         if self.settings.email and self.settings.token:
-            self.account.setText(self.settings.email)
+            self.account_action.setText(self.settings.email)
         else:
-            self.account.setText("Not logged in")
+            self.account_action.setText("Not logged in")
+
+    def _show_home(self) -> None:
+        self.toolbar.hide()
+        self.images_dock.hide()
+        self.pages.setCurrentWidget(self.home)
+        if not self.settings.token:
+            self.home.show_signed_out()
+            self.statusBar().showMessage("Sign in to see your projects")
+            return
+        client = self._client()
+        if client is None:
+            self.home.show_signed_out()
+            return
+        try:
+            projects = client.list_projects()
+        except SyncError as exc:
+            warn(self, str(exc))
+            projects = []
+        self.home.show_projects(projects)
+        self.statusBar().showMessage("Choose a project")
+
+    def _show_project(self, project_id: str) -> None:
+        client = self._client()
+        if client is None:
+            return
+        try:
+            remote = client.get_project(project_id)
+        except SyncError as exc:
+            warn(self, str(exc))
+            return
+        self._remote = remote
+        self.member_role = remote.get("my_role")
+        self.detail.name.setText(remote["name"])
+        self.detail.creator.setText(f"Created by {remote.get('owner_email') or 'unknown'}")
+        self.detail.description.setPlainText(remote.get("description") or "")
+        staff = remote.get("staff") or []
+        self.detail.staff.setText(
+            "\n".join(f"{person['email']}  ({person['role']})" for person in staff) or "No admins yet."
+        )
+        locked = remote.get("status") == "locked"
+        can_edit = self.member_role in {"owner", "admin"}
+        self.detail.description.setReadOnly(not can_edit)
+        self.detail.save_description.setVisible(can_edit)
+        self.detail.email.setVisible(can_edit)
+        self.detail.role.setVisible(can_edit)
+        self.detail.invite_button.setVisible(can_edit)
+        self.detail.review.setVisible(can_edit)
+        self.detail.lock_button.setVisible(self.member_role == "owner")
+        self.detail.lock_button.setText("Unlock project" if locked else "Lock project")
+        self.detail.changes_button.setVisible(self.member_role == "owner")
+        self._fill_branches(client, project_id)
+        self.pages.setCurrentWidget(self.detail)
+        self.toolbar.hide()
+
+    def _fill_branches(self, client: SyncClient, project_id: str) -> None:
+        self.detail.branches.clear()
+        self.detail.notice.clear()
+        if self.member_role not in {"owner", "admin"}:
+            self.detail.notice.hide()
+            self.detail.branches.hide()
+            return
+        try:
+            branches = client.list_branches(project_id)
+        except SyncError as exc:
+            warn(self, str(exc))
+            return
+        self.detail.branches.setVisible(bool(branches))
+        if not branches:
+            self.detail.notice.hide()
+            return
+        self.detail.notice.show()
+        self.detail.notice.setText("A helper committed a change. Load the masks, edit them, then commit. Or discard them.")
+        for branch in branches:
+            paths = ", ".join(branch.get("paths") or [])
+            item = QListWidgetItem(f"{branch['author_email']}  {paths}")
+            item.setData(Qt.UserRole, branch["id"])
+            self.detail.branches.addItem(item)
+        self.detail.branches.setCurrentRow(0)
+
+    def _enter_work(self) -> None:
+        self.pages.setCurrentWidget(self.work)
+        self.toolbar.show()
+
+    def _open_from_detail(self) -> None:
+        if not self._remote:
+            return
+        project_id = self._remote["id"]
+        remembered = self.settings.folder_for(project_id)
+        folder = remembered if remembered and Path(remembered).is_dir() else ""
+        if not folder:
+            folder = QFileDialog.getExistingDirectory(self, "Image folder for this project")
+        if not folder:
+            return
+        self.settings.remember_folder(project_id, folder)
+        self._open_directory(self._remote.get("kind"), project_id, folder)
+        if self.project is None or self.project.state.get("project_id") != project_id:
+            return
+        self._enter_work()
+        self._notice_branches()
+
+    def _notice_branches(self) -> None:
+        if self.member_role not in {"owner", "admin"} or self._remote is None:
+            return
+        client = self._client()
+        if client is None:
+            return
+        try:
+            branches = client.list_branches(self._remote["id"])
+        except SyncError:
+            return
+        if not branches:
+            return
+        lines = [f"{branch['author_email']}: {', '.join(branch.get('paths') or [])}" for branch in branches]
+        info(self, "A helper committed a change.\n" + "\n".join(lines))
+
+    def _save_description(self) -> None:
+        if not self._remote or self.member_role not in {"owner", "admin"}:
+            return
+        client = self._client()
+        if client is None:
+            return
+        text = self.detail.description.toPlainText().strip()
+        try:
+            client.set_description(self._remote["id"], text)
+        except SyncError as exc:
+            warn(self, str(exc))
+            return
+        self._remote["description"] = text
+        self.statusBar().showMessage("Saved the description")
+
+    def _toggle_lock(self) -> None:
+        if not self._remote or self.member_role != "owner":
+            return
+        client = self._client()
+        if client is None:
+            return
+        locked = self._remote.get("status") != "locked"
+        try:
+            result = client.set_locked(self._remote["id"], locked)
+        except SyncError as exc:
+            warn(self, str(exc))
+            return
+        self._remote["status"] = result["status"]
+        self.detail.lock_button.setText("Unlock project" if result["status"] == "locked" else "Lock project")
+        self.statusBar().showMessage("Project locked" if result["status"] == "locked" else "Project unlocked")
+
+    def _invite_from_detail(self) -> None:
+        if not self._remote:
+            return
+        email = self.detail.email.text().strip()
+        if not email:
+            return
+        client = self._client()
+        if client is None:
+            return
+        try:
+            result = client.invite(self._remote["id"], email, self.detail.role.currentText())
+        except SyncError as exc:
+            warn(self, str(exc))
+            return
+        self.detail.email.clear()
+        info(self, "They have access." if result["status"] == "joined" else "Invite saved until they create an account.")
+
+    def _show_changes(self) -> None:
+        if not self._remote or self.member_role != "owner":
+            return
+        client = self._client()
+        if client is None:
+            return
+        try:
+            rows = client.changes(self._remote["id"])
+        except SyncError as exc:
+            warn(self, str(exc))
+            return
+        if not rows:
+            info(self, "No commits yet.")
+            return
+        lines = []
+        for row in rows:
+            lines.append(f"{row['created_at']}  {row['author_email']}")
+            images = row.get("images") or []
+            if not images:
+                lines.append("  No cell counts for this commit.")
+            for image in images:
+                lines.append(
+                    f"  {image['path']}: {image['added']} added, {image['deleted']} deleted, {image['edited']} edited"
+                )
+        info(self, "\n".join(lines))
+
+    def _load_branch(self) -> None:
+        if not self._remote or self.member_role not in {"owner", "admin"}:
+            return
+        branch_id = self.detail.current_branch()
+        if not branch_id:
+            warn(self, "Choose a helper commit first.")
+            return
+        if self.project is None or self.project.state.get("project_id") != self._remote["id"]:
+            self._open_from_detail()
+        if self.project is None or self.project.state.get("project_id") != self._remote["id"]:
+            return
+        client = self._client()
+        if client is None:
+            return
+        try:
+            payload = client.branch_archive(self._remote["id"], branch_id)
+        except SyncError as exc:
+            warn(self, str(exc))
+            return
+        self._apply_snapshot(client, self._remote["id"], branch_id, mode="working", payload=payload)
+        self.project.meta = load_meta(self.project.root)
+        files = read_zip(payload)
+        image = None
+        for path in files:
+            if path.endswith("_seg.npy"):
+                image = self._image_for_seg(path)
+                if image:
+                    break
+        if image:
+            self._load(image)
+        else:
+            self._reload_current()
+        self._enter_work()
+        self.statusBar().showMessage("Loaded the helper masks into the working copy. Commit to share them.")
+
+    def _image_for_seg(self, seg_rel: str) -> str | None:
+        if self.project is None:
+            return None
+        for relpath in self.project.rels:
+            committed, _working = seg_pair(self.project.image_path(relpath))
+            if self.project.rel(committed) == seg_rel:
+                return relpath
+        return None
+
+    def _discard_branch(self) -> None:
+        if not self._remote or self.member_role not in {"owner", "admin"}:
+            return
+        branch_id = self.detail.current_branch()
+        if not branch_id:
+            warn(self, "Choose a helper commit first.")
+            return
+        if not confirm(self, "Discard this helper commit? Its masks will be removed from the shared project."):
+            return
+        client = self._client()
+        if client is None:
+            return
+        try:
+            client.discard_branch(self._remote["id"], branch_id)
+            self._fill_branches(client, self._remote["id"])
+        except SyncError as exc:
+            warn(self, str(exc))
+            return
+        self.statusBar().showMessage("Discarded the helper commit")
 
     def _client(self) -> SyncClient | None:
         if not self.settings.token:
@@ -293,8 +647,9 @@ class MainWindow(QMainWindow):
     def open_folder(self) -> None:
         self._open_directory(None, None)
 
-    def _open_directory(self, kind: str | None, project_id: str | None) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Image folder")
+    def _open_directory(self, kind: str | None, project_id: str | None, folder: str | None = None) -> None:
+        if not folder:
+            folder = QFileDialog.getExistingDirectory(self, "Image folder")
         if not folder:
             return
         self._flush_current()
@@ -310,6 +665,10 @@ class MainWindow(QMainWindow):
         elif kind and project.meta.kind != kind:
             warn(self, f"This folder was marked {project.meta.kind}. The shared project is {kind}.")
         if project_id:
+            existing = project.state.get("project_id")
+            if existing and existing != project_id:
+                warn(self, "This folder belongs to a different project.")
+                return
             project.state["project_id"] = project_id
             project.save_state()
         if not project.images:
@@ -326,13 +685,12 @@ class MainWindow(QMainWindow):
         if item is not None:
             self._load(item.data(Qt.UserRole))
         self.statusBar().showMessage(f"Opened {root}")
+        self._enter_work()
 
     def _set_stack_tools(self) -> None:
         enabled = bool(self.project and self.project.meta.kind == "zstack")
-        for name in ("Same cell", "Finish linking", "Fill"):
-            button = self.findChild(QPushButton, name)
-            if button is not None:
-                button.setEnabled(enabled)
+        for action in (self.same_cell_action, self.finish_action, self.fill_action):
+            action.setEnabled(enabled)
 
     def _ordered_rels(self) -> list[str]:
         rels = self.project.rels if self.project else []
@@ -372,7 +730,7 @@ class MainWindow(QMainWindow):
         self.current_rel = relpath
         array = self.project.array_of(relpath)
         session = self.project.load_session(relpath)
-        self.canvas.set_image(session, display_rgb(array, self.channel.currentData()))
+        self.canvas.set_image(session, self._rgb(array))
         self._apply_link_colors()
         self._showing_score = True
         self.score.setCurrentIndex(0 if session.readiness is None else session.readiness)
@@ -382,8 +740,8 @@ class MainWindow(QMainWindow):
         if session.warning:
             self.statusBar().showMessage(session.warning)
         path = self.project.image_path(relpath)
-        if page_count(path) > 1:
-            self.statusBar().showMessage(f"{relpath}: this file has multiple pages. Showing the first page.")
+        if page_count(path) > 1 and len(split_layers(array)) == 1:
+            self.statusBar().showMessage(f"{relpath}: this file has many pages. Showing the first page.")
 
     def _flush_current(self) -> None:
         if self.project is None or self.current_rel is None or self.canvas.session is None:
@@ -408,11 +766,37 @@ class MainWindow(QMainWindow):
             self.scores[self.current_rel] = self.canvas.session.readiness
         self._refresh_list()
 
-    def _change_channel(self) -> None:
+    def _rgb(self, array):
+        colors = self.project.layer_colors if self.project else None
+        return render_display(array, self.channel.currentData() or "layers", colors)
+
+    def _change_channel(self, action: QAction | None = None) -> None:
+        if isinstance(action, QAction):
+            index = self.channel.findData(action.data())
+            if index >= 0:
+                self.channel.setCurrentIndex(index)
         if self.project is None or self.current_rel is None:
             return
-        rgb = display_rgb(self.project.array_of(self.current_rel), self.channel.currentData())
-        self.canvas.set_display(rgb)
+        self.canvas.set_display(self._rgb(self.project.array_of(self.current_rel)))
+
+    def edit_layer_colors(self) -> None:
+        if self.project is None or self.current_rel is None:
+            warn(self, "Open an image folder first.")
+            return
+        planes = split_layers(self.project.array_of(self.current_rel))
+        colors = list(self.project.layer_colors or default_layer_colors(len(planes)))
+        if len(colors) < len(planes):
+            colors.extend(default_layer_colors(len(planes))[len(colors) :])
+        dialog = LayerColorDialog(colors[: len(planes)], self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.project.save_layer_colors(dialog.colors())
+        self.channel.setCurrentIndex(0)
+        layers = self.channel_actions.get("layers")
+        if layers is not None:
+            layers.setChecked(True)
+        self._change_channel()
+        self.statusBar().showMessage("Saved layer colors for this folder")
 
     def _on_edited(self) -> None:
         self.statusBar().showMessage("Edited the working copy")
@@ -502,6 +886,8 @@ class MainWindow(QMainWindow):
         session = self.canvas.session
         if session is None or self.project is None or self.current_rel is None or not self.canvas.selected:
             return
+        if not confirm(self, "Delete the selected cells?"):
+            return
         session.checkpoint()
         session.masks = delete_labels(session.masks, set(self.canvas.selected))
         for label in list(self.canvas.selected):
@@ -516,6 +902,13 @@ class MainWindow(QMainWindow):
         if self.canvas.session and self.canvas.session.undo():
             self.canvas.refresh()
             self._apply_link_colors()
+            self.statusBar().showMessage("Went back one edit")
+
+    def redo(self) -> None:
+        if self.canvas.session and self.canvas.session.redo():
+            self.canvas.refresh()
+            self._apply_link_colors()
+            self.statusBar().showMessage("Redid the edit")
 
     def same_cell(self) -> None:
         if self.project is None or self.project.meta.kind != "zstack" or self.current_rel is None:
@@ -582,6 +975,7 @@ class MainWindow(QMainWindow):
         if path:
             self.weights_path = path
             self.model.setCurrentText("Custom weights")
+            self.weights_name.setText(Path(path).name)
             self.statusBar().showMessage(Path(path).name)
 
     def _model_args(self):
@@ -596,7 +990,8 @@ class MainWindow(QMainWindow):
         return model_name, weights, diameter, channels
 
     def run_current(self) -> None:
-        if self.current_rel is None:
+        if self.project is None or self.current_rel is None:
+            warn(self, "Open an image first. Use the menu, then Image, then Images and ranking.")
             return
         self._start_model([self.current_rel])
 
@@ -604,7 +999,7 @@ class MainWindow(QMainWindow):
         if self.project is None:
             return
         dialog = BatchDialog(self.project.rels, self.current_rel, self)
-        if dialog.exec() != dialog.Accepted:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         chosen = dialog.chosen()
         if not chosen:
@@ -654,9 +1049,12 @@ class MainWindow(QMainWindow):
 
     def login(self) -> None:
         dialog = LoginDialog(self.settings.server_url, self.settings.email, self)
-        if dialog.exec() != dialog.Accepted:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.settings.server_url = dialog.server.text().strip() or self.settings.server_url
+        if not ensure_local_server(self.settings.server_url):
+            warn(self, "Cannot reach the account server. Check the address, or leave it as http://127.0.0.1:8765.")
+            return
         client = SyncClient(self.settings.server_url)
         try:
             if dialog.action == "register":
@@ -670,6 +1068,7 @@ class MainWindow(QMainWindow):
         self.settings.email = result["email"]
         self.settings.save()
         self._account_label()
+        self._show_home()
         self.statusBar().showMessage(f"Logged in as {self.settings.email}")
 
     def publish(self) -> None:
@@ -679,15 +1078,25 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "Publish project", "Project name")
         if not ok or not name.strip():
             return
+        description, ok = QInputDialog.getMultiLineText(self, "Publish project", "Description")
+        if not ok:
+            return
         self.statusBar().showMessage("Hashing images…")
         try:
-            created = client.create_project(name.strip(), self.project.meta.kind, {"files": self.project.file_manifest()})
+            created = client.create_project(
+                name.strip(),
+                self.project.meta.kind,
+                {"files": self.project.file_manifest()},
+                description.strip(),
+            )
         except SyncError as exc:
             warn(self, str(exc))
             return
         self.project.state["project_id"] = created["id"]
         self.project.state["base_commit_id"] = None
         self.project.save_state()
+        self.settings.remember_folder(created["id"], str(self.project.root))
+        self.member_role = "owner"
         self.statusBar().showMessage("Project published. Commit when you want to share masks.")
 
     def commit(self) -> None:
@@ -704,11 +1113,17 @@ class MainWindow(QMainWindow):
         if not files:
             info(self, "There are no working-copy changes to commit.")
             return
+        role = self._role_for(project_id)
+        if role != "helper" and not confirm(self, "Commit these masks to the shared project?"):
+            return
         parent = self.project.state.get("base_commit_id")
         try:
             result = self._commit_with_conflicts(client, project_id, parent, files)
         except SyncError as exc:
             warn(self, str(exc))
+            return
+        if result.get("branch"):
+            self.statusBar().showMessage("Committed to your branch. An owner or admin will review it.")
             return
         self._apply_snapshot(client, project_id, result["id"], mode="committed")
         self.project.state["base_commit_id"] = result["id"]
@@ -716,6 +1131,20 @@ class MainWindow(QMainWindow):
         self.project.meta = load_meta(self.project.root)
         self._reload_current()
         self.statusBar().showMessage("Committed. The shared masks now match this working copy.")
+
+    def _role_for(self, project_id: str) -> str | None:
+        if self.member_role and self._remote and self._remote.get("id") == project_id:
+            return self.member_role
+        client = self._client()
+        if client is None:
+            return self.member_role
+        try:
+            remote = client.get_project(project_id)
+        except SyncError:
+            return self.member_role
+        self._remote = remote
+        self.member_role = remote.get("my_role")
+        return self.member_role
 
     def _commit_with_conflicts(self, client, project_id, parent, files):
         try:
@@ -727,7 +1156,7 @@ class MainWindow(QMainWindow):
                     raise SyncError("Pull the latest commit before committing.") from exc
                 raise
             dialog = ConflictDialog(conflicts, self)
-            if dialog.exec() != dialog.Accepted:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
                 raise SyncError("Commit cancelled") from exc
             return client.commit(project_id, parent, files, dialog.resolutions())
 
@@ -799,7 +1228,7 @@ class MainWindow(QMainWindow):
             info(self, "No commits yet.")
             return
         dialog = HistoryDialog(commits, self)
-        if dialog.exec() != dialog.Accepted or not dialog.chosen:
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.chosen:
             return
         try:
             self._apply_snapshot(client, self.project.state["project_id"], dialog.chosen, mode="working")
@@ -823,7 +1252,7 @@ class MainWindow(QMainWindow):
             info(self, "You have no shared projects yet.")
             return
         dialog = ProjectListDialog(projects, self)
-        if dialog.exec() != dialog.Accepted or not dialog.project_id():
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.project_id():
             return
         try:
             remote = client.get_project(dialog.project_id())
@@ -844,8 +1273,11 @@ class MainWindow(QMainWindow):
         email, ok = QInputDialog.getText(self, "Invite", "Email")
         if not ok or not email.strip():
             return
+        role, ok = QInputDialog.getItem(self, "Invite", "Role", ["helper", "admin"], 0, False)
+        if not ok:
+            return
         try:
-            result = client.invite(self.project.state["project_id"], email.strip())
+            result = client.invite(self.project.state["project_id"], email.strip(), role)
         except SyncError as exc:
             warn(self, str(exc))
             return
@@ -885,6 +1317,68 @@ class MainWindow(QMainWindow):
             if answer == QMessageBox.Save:
                 self.save()
         super().closeEvent(event)
+
+
+def _action(text: str, slot, primary: bool = False, name: str = "") -> QPushButton:
+    widget = QPushButton(text)
+    widget.clicked.connect(slot)
+    if name:
+        widget.setObjectName(name)
+    elif primary:
+        widget.setObjectName("primary")
+    return widget
+
+
+_STYLE = """
+QMainWindow, QWidget { background: #0F172A; color: #F8FAFC; font-family: "Segoe UI"; font-size: 13px; }
+QLabel { background: transparent; }
+QMenuBar { background: #1E293B; color: #F8FAFC; spacing: 4px; }
+QMenuBar::item { background: transparent; padding: 6px 12px; }
+QMenuBar::item:selected { background: #334155; }
+QMenu { background: #1E293B; color: #F8FAFC; border: 1px solid #475569; padding: 4px; }
+QMenu::item { padding: 6px 24px; }
+QMenu::item:selected { background: #334155; }
+QMenu::item:disabled { color: #94A3B8; }
+QToolBar { background: #1E293B; border: none; spacing: 8px; padding: 6px 8px; }
+QDockWidget { color: #F8FAFC; }
+QDockWidget::title { background: #1E293B; padding: 6px; }
+QLabel#hint { padding: 6px 12px; }
+QGroupBox {
+    background: #1E293B;
+    border: 1px solid #475569;
+    border-radius: 10px;
+    margin-top: 14px;
+    padding-top: 8px;
+    font-weight: 600;
+}
+QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; color: #94A3B8; }
+QPushButton, QToolButton {
+    background: #334155;
+    color: #F8FAFC;
+    border: 1px solid #475569;
+    border-radius: 8px;
+    padding: 6px 12px;
+    min-height: 28px;
+}
+QPushButton:hover, QToolButton:hover { background: #3B4C63; }
+QPushButton:checked, QToolButton:checked { background: #22C55E; color: #052E16; border-color: #22C55E; }
+QToolButton#erase:checked { background: #EF4444; color: #FFFFFF; border-color: #EF4444; }
+QPushButton#primary { background: #22C55E; color: #052E16; border: none; font-weight: 700; }
+QPushButton#primary:hover { background: #4ADE80; }
+QListWidget, QComboBox, QSpinBox, QLineEdit {
+    background: #0F172A;
+    color: #F8FAFC;
+    border: 1px solid #475569;
+    border-radius: 8px;
+    padding: 4px 6px;
+}
+QListWidget::item { padding: 6px 4px; }
+QListWidget::item:selected { background: #1D4ED8; color: #F8FAFC; }
+QLabel#hint, QLabel#account, QGroupBox::title { color: #94A3B8; }
+QLabel#section { font-size: 16px; font-weight: 700; color: #F8FAFC; }
+QWidget#side { background: #1E293B; border: 1px solid #475569; border-radius: 10px; }
+QStatusBar { background: #1E293B; color: #94A3B8; }
+"""
 
 
 def _working_name(relpath: str) -> str:

@@ -3,8 +3,10 @@ from __future__ import annotations
 import zipfile
 from io import BytesIO
 
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -45,12 +47,18 @@ def ask_kind(parent) -> str | None:
 class LoginDialog(QDialog):
     def __init__(self, server_url: str, email: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Account")
+        self.setWindowTitle("Sign in")
         layout = QFormLayout(self)
         self.server = QLineEdit(server_url)
         self.email = QLineEdit(email)
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.Password)
+        note = QLabel(
+            "Accounts are saved on this computer. The server starts with the app. "
+            "Use a password of 8 or more characters."
+        )
+        note.setWordWrap(True)
+        layout.addRow(note)
         layout.addRow("Server", self.server)
         layout.addRow("Email", self.email)
         layout.addRow("Password", self.password)
@@ -213,9 +221,58 @@ def read_zip(payload: bytes) -> dict[str, bytes]:
     return found
 
 
+class LayerColorDialog(QDialog):
+    def __init__(self, colors: list[str | None], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Layer colors")
+        self.setMinimumWidth(360)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("These colors are saved for this folder. Uncheck a layer to hide it."))
+        self._colors = list(colors)
+        self._checks: list[QCheckBox] = []
+        self._buttons: list[QPushButton] = []
+        for index, color in enumerate(self._colors):
+            row = QHBoxLayout()
+            check = QCheckBox(f"Layer {index + 1}")
+            check.setChecked(bool(color))
+            button = QPushButton(color or "#888888")
+            button.setStyleSheet(f"background: {color or '#334155'}; color: #F8FAFC;")
+            button.clicked.connect(lambda _checked=False, i=index: self._pick(i))
+            row.addWidget(check)
+            row.addWidget(button)
+            layout.addLayout(row)
+            self._checks.append(check)
+            self._buttons.append(button)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _pick(self, index: int) -> None:
+        current = QColor(self._colors[index] or "#F8FAFC")
+        chosen = QColorDialog.getColor(current, self, f"Layer {index + 1}")
+        if not chosen.isValid():
+            return
+        self._colors[index] = chosen.name()
+        self._buttons[index].setText(chosen.name())
+        self._buttons[index].setStyleSheet(f"background: {chosen.name()}; color: #0F172A;")
+        self._checks[index].setChecked(True)
+
+    def colors(self) -> list[str | None]:
+        result = []
+        for check, color in zip(self._checks, self._colors):
+            result.append(color if check.isChecked() and color else None)
+        return result
+
+
 def info(parent, text: str) -> None:
     QMessageBox.information(parent, "CellAnnotator", text)
 
 
 def warn(parent, text: str) -> None:
     QMessageBox.warning(parent, "CellAnnotator", text)
+
+
+def confirm(parent, text: str) -> bool:
+    answer = QMessageBox.question(parent, "CellAnnotator", text, QMessageBox.Yes | QMessageBox.No)
+    return answer == QMessageBox.Yes

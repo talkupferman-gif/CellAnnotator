@@ -17,6 +17,24 @@ def rasterize_polygon(shape: tuple[int, int], points: list[tuple[float, float]])
     return np.array(canvas, dtype=bool)
 
 
+def erase_closed_outline(
+    masks: np.ndarray,
+    points: list[tuple[float, float]],
+    labels: set[int] | None = None,
+) -> tuple[np.ndarray, set[int]]:
+    """Remove the inside of a closed loop. A label set limits the cut to those cells."""
+    polygon = rasterize_polygon(masks.shape, points)
+    inside = polygon & (masks > 0)
+    if labels:
+        inside &= np.isin(masks, list(labels))
+    if not inside.any():
+        return masks, set()
+    touched = {int(value) for value in np.unique(masks[inside])}
+    out = masks.copy()
+    out[inside] = 0
+    return out, touched
+
+
 def add_closed_outline(masks: np.ndarray, points: list[tuple[float, float]]) -> tuple[np.ndarray, int]:
     """Fill a closed outline. Pixels that already belong to a cell stay with that cell."""
     polygon = rasterize_polygon(masks.shape, points)
@@ -170,6 +188,49 @@ def interpolate_binary(mask_a: np.ndarray, mask_b: np.ndarray, t: float) -> np.n
     aligned_b = _shift_bool(mask_b, *(target - center_b))
     blended = (1.0 - t) * signed_distance(aligned_a) + t * signed_distance(aligned_b)
     return blended > 0
+
+
+def interior_outline(masks: np.ndarray, width: int = 2) -> np.ndarray:
+    """A band of pixels inside each cell, wide enough to read at normal zoom."""
+    band = np.zeros(masks.shape, dtype=bool)
+    if width < 1 or int(masks.max()) == 0:
+        return band
+    structure = ndimage.generate_binary_structure(2, 1)
+    for label in np.unique(masks):
+        if int(label) == 0:
+            continue
+        region = masks == label
+        core = region
+        for _ in range(width):
+            core = ndimage.binary_erosion(core, structure=structure, border_value=0)
+            if not core.any():
+                break
+        band |= region & ~core
+    return band
+
+
+def mask_change_counts(before: np.ndarray | None, after: np.ndarray) -> dict[str, int]:
+    """Count cells added, deleted, or edited between two label images."""
+    before_labels = _labels(before)
+    after_labels = _labels(after)
+    edited = 0
+    if before is not None and before.shape == after.shape:
+        for label in before_labels & after_labels:
+            if not np.array_equal(before == label, after == label):
+                edited += 1
+    elif before is not None:
+        edited = len(before_labels & after_labels)
+    return {
+        "added": len(after_labels - before_labels),
+        "deleted": len(before_labels - after_labels),
+        "edited": edited,
+    }
+
+
+def _labels(masks: np.ndarray | None) -> set[int]:
+    if masks is None or masks.size == 0:
+        return set()
+    return {int(value) for value in np.unique(masks) if int(value) > 0}
 
 
 def edge_mask(masks: np.ndarray) -> np.ndarray:

@@ -21,6 +21,7 @@ class Project:
         self.meta = meta if meta is not None else load_meta(self.root)
         self.images = scan_images(self.root)
         self.state = load_state(self.root)
+        self.layer_colors = self.load_layer_colors()
         self._shapes: dict[str, tuple[int, int]] = {}
         self._arrays: dict[str, object] = {}
 
@@ -100,6 +101,22 @@ class Project:
         folder = self.root / STATE_DIR
         folder.mkdir(exist_ok=True)
         (folder / STATE_NAME).write_text(json.dumps(self.state, indent=2), encoding="utf-8")
+
+    def load_layer_colors(self) -> list[str | None] | None:
+        path = self.root / STATE_DIR / "layer_colors.json"
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return list(data.get("colors", []))
+
+    def save_layer_colors(self, colors: list[str | None]) -> None:
+        folder = self.root / STATE_DIR
+        folder.mkdir(exist_ok=True)
+        (folder / "layer_colors.json").write_text(
+            json.dumps({"colors": colors}, indent=2),
+            encoding="utf-8",
+        )
+        self.layer_colors = colors
 
 
 def scan_images(root: Path) -> list[Path]:

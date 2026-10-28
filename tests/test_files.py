@@ -1,6 +1,7 @@
 import numpy as np
 
 from cellannotator.files import natural_key
+from cellannotator.images import composite_layers
 from cellannotator.project import Project, scan_images
 from cellannotator.segio import MaskSession, load_session_for_image, save_session, seg_pair
 
@@ -42,3 +43,15 @@ def test_scan_skips_mask_files(tmp_path):
     assert names == ["a.png", "b.tif"]
     project = Project(tmp_path)
     assert project.rels == ["a.png", "b.tif"]
+
+
+def test_two_layers_keep_their_colors():
+    red = np.zeros((8, 8), np.uint8)
+    red[:, :4] = 255
+    blue = np.zeros((8, 8), np.uint8)
+    blue[:, 4:] = 255
+    image = composite_layers([red, blue], ["#FF0000", "#0000FF"])
+    assert image[0, 1, 0] > 200
+    assert image[0, 1, 2] < 30
+    assert image[0, 6, 2] > 200
+    assert image[0, 6, 0] < 30

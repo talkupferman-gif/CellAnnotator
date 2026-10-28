@@ -10,13 +10,29 @@ from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
-from cellannotator.masks import add_closed_outline, edge_mask, erase_segment
+from cellannotator.masks import add_closed_outline, erase_closed_outline, interior_outline
 from cellannotator.segio import MaskSession
+
+
+OUTLINE_COLORS = (
+    (255, 77, 109),
+    (77, 171, 247),
+    (105, 219, 124),
+    (255, 212, 59),
+    (177, 151, 252),
+    (255, 146, 43),
+    (34, 184, 207),
+    (240, 101, 149),
+    (116, 143, 252),
+    (255, 107, 107),
+    (99, 230, 190),
+    (255, 169, 77),
+)
 
 
 def rgb_for_key(key: str) -> tuple[int, int, int]:
     digest = hashlib.md5(key.encode("utf-8")).digest()
-    return tuple(70 + byte % 170 for byte in digest[:3])
+    return OUTLINE_COLORS[digest[0] % len(OUTLINE_COLORS)]
 
 
 def to_qimage(array: np.ndarray) -> QImage:
@@ -44,7 +60,8 @@ class Canvas(QWidget):
         self.mode = "draw"
         self.brush_radius = 8
         self.show_fill = True
-        self.show_outlines = True
+        self.show_outlines = False
+        self.masks_visible = True
         self.selected: set[int] = set()
         self.color_keys: dict[int, str] = {}
         self._rgb: np.ndarray | None = None
@@ -58,21 +75,13 @@ class Canvas(QWidget):
         self._moved = False
         self._stroke: list[tuple[float, float]] = []
         self._stroking = False
-        self._erase_labels: set[int] = set()
-        self._erase_touched: set[int] = set()
-        self._stroke_changed = False
-
     def set_mode(self, mode: str) -> None:
-        if self._stroking and self.mode == "draw":
-            self._cancel_stroke()
-        elif self._stroking and self.mode == "erase":
-            self._finish_erase(keep=True)
+        self._cancel_stroke()
         self.mode = mode
         self.status.emit("Draw" if mode == "draw" else "Erase")
         self.update()
 
     def set_image(self, session: MaskSession, rgb: np.ndarray) -> None:
-        self._finish_erase(keep=True)
         self._cancel_stroke()
         self.session = session
         self._rgb = rgb
@@ -139,6 +148,9 @@ class Canvas(QWidget):
         masks = self.session.masks
         height, width = masks.shape
         rgba = np.zeros((height, width, 4), np.uint8)
+        if not self.masks_visible:
+            self._overlay = to_qimage(rgba)
+            return
         labels = [int(value) for value in np.unique(masks) if int(value) > 0]
         if labels:
             table = np.zeros((max(labels) + 1, 3), np.uint8)
@@ -148,19 +160,22 @@ class Canvas(QWidget):
                 foreground = masks > 0
                 rgba[foreground, :3] = table[masks[foreground]]
                 rgba[foreground, 3] = 80
+                if self.selected:
+                    chosen = np.isin(masks, list(self.selected))
+                    rgba[chosen, 3] = 150
             if self.show_outlines:
-                edges = edge_mask(masks)
+                edges = interior_outline(masks, width=3)
                 rgba[edges, :3] = table[masks[edges]]
-                rgba[edges, 3] = 230
-            if self.selected:
-                selected_edges = edge_mask(masks) & np.isin(masks, list(self.selected))
-                rgba[selected_edges, :3] = (255, 255, 255)
-                rgba[selected_edges, 3] = 255
+                rgba[edges, 3] = 255
+                if self.selected:
+                    selected = interior_outline(masks, width=4) & np.isin(masks, list(self.selected))
+                    rgba[selected, :3] = (255, 255, 255)
+                    rgba[selected, 3] = 255
         self._overlay = to_qimage(rgba)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#202124"))
+        painter.fillRect(self.rect(), QColor("#0F172A"))
         if self._base is None:
             painter.end()
             return
@@ -171,14 +186,14 @@ class Canvas(QWidget):
         if self._overlay is not None:
             painter.drawImage(0, 0, self._overlay)
         if len(self._stroke) >= 2:
-            pen = QPen(QColor("#ffd166") if self.mode == "draw" else QColor("#ff5a5a"))
-            pen.setWidthF(max(1.0, 1.5 / self._zoom))
+            pen = QPen(QColor("#22C55E") if self.mode == "draw" else QColor("#EF4444"))
+            pen.setWidthF(max(2.0, 3.0 / self._zoom))
             painter.setPen(pen)
             for start, end in zip(self._stroke, self._stroke[1:]):
                 painter.drawLine(QPointF(*start), QPointF(*end))
-        if self._stroking and self._stroke and self.mode == "draw":
-            pen = QPen(QColor("#ff4d4d"))
-            pen.setWidthF(max(1.0, 1.5 / self._zoom))
+        if self._stroking and self._stroke:
+            pen = QPen(QColor("#F8FAFC"))
+            pen.setWidthF(max(1.5, 2.0 / self._zoom))
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
             radius = self._close_distance()
@@ -228,10 +243,11 @@ class Canvas(QWidget):
             if math.hypot(point[0] - last[0], point[1] - last[1]) < 0.5:
                 return
         self._stroke.append(point)
-        if self.mode == "erase":
-            self._erase_along(self._stroke[-2], point)
-        elif self._ready_to_close():
-            self._close_outline()
+        if self._ready_to_close():
+            if self.mode == "erase":
+                self._close_erase()
+            else:
+                self._close_outline()
             return
         self.update()
 
@@ -241,83 +257,40 @@ class Canvas(QWidget):
             if not self._moved:
                 self._select_at(self._screen_to_image(event.position()), event.modifiers() & Qt.ShiftModifier)
             self.update()
-        if event.button() == Qt.RightButton and self.mode == "erase" and self._stroking:
-            # A second right-click is delivered as press+release. The press already
-            # started the stroke; this release is the same click, so do not end it.
-            return
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if event.key() == Qt.Key_Escape:
-            if self.mode == "draw":
-                self._cancel_stroke()
-            else:
-                self._finish_erase(keep=True)
+            self._cancel_stroke()
             return
-        if event.key() == Qt.Key_Comma:
-            self.brush_radius = max(1, self.brush_radius - 1)
-            self.status.emit(f"Brush {self.brush_radius}px")
-        elif event.key() == Qt.Key_Period:
-            self.brush_radius += 1
-            self.status.emit(f"Brush {self.brush_radius}px")
-        else:
-            super().keyPressEvent(event)
+        super().keyPressEvent(event)
 
     def _start_stroke(self, point: tuple[float, float]) -> None:
-        if self.session is None:
+        if self.session is None or self._stroking:
             return
-        if self._stroking and self.mode == "erase":
-            self._finish_erase(keep=True)
-            return
-        if self._stroking and self.mode == "draw":
-            return
-        if self.mode == "erase":
-            if self.selected:
-                labels = set(self.selected)
-            else:
-                label = self._label_at(*point)
-                labels = {label} if label else set()
-            if not labels:
-                self.status.emit("Select a cell, or right-click a cell, to erase")
-                return
-            self.session.checkpoint()
-            self._erase_labels = labels
-            self._erase_touched = set()
-            self._stroke_changed = False
         self._stroking = True
         self._stroke = [point]
         self.update()
 
-    def _erase_along(self, start: tuple[float, float], end: tuple[float, float]) -> None:
+    def _close_erase(self) -> None:
         if self.session is None:
             return
-        updated, touched = erase_segment(self.session.masks, start, end, self.brush_radius, self._erase_labels)
-        if touched:
-            self.session.masks = updated
-            self._erase_touched |= touched
-            self._stroke_changed = True
-            self._rebuild_overlay()
-
-    def _finish_erase(self, keep: bool) -> None:
-        if not self._stroking or self.mode != "erase":
-            self._stroking = False
-            self._stroke = []
-            return
+        labels = set(self.selected) if self.selected else None
+        self.session.checkpoint()
+        updated, touched = erase_closed_outline(self.session.masks, self._stroke, labels)
         self._stroking = False
         self._stroke = []
-        if self.session is None:
-            return
-        if not keep or not self._stroke_changed:
-            if self._stroke_changed and not keep:
-                self.session.undo()
-            elif not self._stroke_changed:
-                self.session.drop_checkpoint()
+        if not touched:
+            self.session.drop_checkpoint()
+            self.status.emit("That loop did not cut a cell")
         else:
-            for label in self._erase_touched:
+            self.session.masks = updated
+            for label in touched:
                 if (self.session.masks == label).any():
                     self.session.set_manual(label, True)
             self.session.dirty = True
-            self.labelsTouched.emit(set(self._erase_touched))
+            self.labelsTouched.emit(touched)
             self.edited.emit()
+            self.status.emit("Cut the inside of the loop")
         self._rebuild_overlay()
         self.update()
 

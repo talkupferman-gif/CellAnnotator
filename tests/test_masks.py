@@ -3,11 +3,13 @@ import numpy as np
 from cellannotator.masks import (
     add_closed_outline,
     delete_labels,
+    erase_closed_outline,
     erase_disk,
     interpolate_binary,
     merge_labels,
     split_label,
 )
+from cellannotator.segio import MaskSession
 
 
 def _square(masks, top, left, size, label=None):
@@ -28,6 +30,40 @@ def test_outline_keeps_existing_pixels():
     assert first == 1 and second == 2
     assert masks[8, 8] == 1
     assert masks[25, 25] == 2
+
+
+def test_mask_change_counts_added_deleted_and_edited():
+    from cellannotator.masks import mask_change_counts
+
+    before = np.zeros((4, 4), np.int32)
+    before[0, 0] = 1
+    after = before.copy()
+    after[0, 0] = 0
+    after[1, 1] = 2
+    after[2, 2] = 1
+    counts = mask_change_counts(before, after)
+    assert counts == {"added": 1, "deleted": 0, "edited": 1}
+
+
+def test_closed_erase_cuts_only_the_inside():
+    masks = np.zeros((40, 40), np.int32)
+    masks[5:30, 5:30] = 1
+    points = [(10, 10), (22, 10), (22, 22), (10, 22)]
+    updated, touched = erase_closed_outline(masks, points, None)
+    assert touched == {1}
+    assert updated[16, 16] == 0
+    assert updated[6, 6] == 1
+
+
+def test_undo_then_redo_restores_the_edit():
+    session = MaskSession.empty(4, 4)
+    session.masks[0, 0] = 1
+    session.checkpoint()
+    session.masks[0, 0] = 2
+    assert session.undo()
+    assert session.masks[0, 0] == 1
+    assert session.redo()
+    assert session.masks[0, 0] == 2
 
 
 def test_erase_selected_cell_only():

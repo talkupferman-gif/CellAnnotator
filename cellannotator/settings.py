@@ -13,10 +13,17 @@ def settings_path() -> Path:
 
 
 class Settings:
-    def __init__(self, server_url: str = "http://127.0.0.1:8765", token: str | None = None, email: str = ""):
+    def __init__(
+        self,
+        server_url: str = "http://127.0.0.1:8765",
+        token: str | None = None,
+        email: str = "",
+        folders: dict | None = None,
+    ):
         self.server_url = server_url
         self.token = token
         self.email = email
+        self.folders = dict(folders or {})
 
     @classmethod
     def load(cls) -> Settings:
@@ -28,10 +35,27 @@ class Settings:
             server_url=data.get("server_url") or "http://127.0.0.1:8765",
             token=data.get("token"),
             email=data.get("email") or "",
+            folders=data.get("folders") or {},
         )
+
+    def folder_for(self, project_id: str) -> str | None:
+        value = self.folders.get(project_id)
+        return str(value) if value else None
+
+    def remember_folder(self, project_id: str, folder: str) -> None:
+        self.folders[project_id] = str(folder)
+        self.save()
 
     def save(self) -> None:
         settings_path().write_text(
-            json.dumps({"server_url": self.server_url, "token": self.token, "email": self.email}, indent=2),
+            json.dumps(
+                {
+                    "server_url": self.server_url,
+                    "token": self.token,
+                    "email": self.email,
+                    "folders": self.folders,
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )

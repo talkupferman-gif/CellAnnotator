@@ -40,6 +40,7 @@ class MaskSession:
         self.dirty = False
         self.warning = ""
         self._undo: list[tuple[np.ndarray, np.ndarray]] = []
+        self._redo: list[tuple[np.ndarray, np.ndarray]] = []
 
     @classmethod
     def empty(cls, height: int, width: int, filename: str = "") -> MaskSession:
@@ -63,13 +64,23 @@ class MaskSession:
 
     def checkpoint(self) -> None:
         self._undo.append((self.masks.copy(), self.ismanual.copy()))
+        self._redo.clear()
         if len(self._undo) > 30:
             self._undo.pop(0)
 
     def undo(self) -> bool:
         if not self._undo:
             return False
+        self._redo.append((self.masks.copy(), self.ismanual.copy()))
         self.masks, self.ismanual = self._undo.pop()
+        self.dirty = True
+        return True
+
+    def redo(self) -> bool:
+        if not self._redo:
+            return False
+        self._undo.append((self.masks.copy(), self.ismanual.copy()))
+        self.masks, self.ismanual = self._redo.pop()
         self.dirty = True
         return True
 
