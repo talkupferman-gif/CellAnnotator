@@ -1,7 +1,7 @@
 import numpy as np
 
 from cellannotator.files import natural_key
-from cellannotator.images import composite_layers
+from cellannotator.images import LAYER_PALETTE, color_name, composite_layers
 from cellannotator.project import Project, scan_images
 from cellannotator.segio import MaskSession, load_session_for_image, save_session, seg_pair
 
@@ -43,6 +43,11 @@ def test_scan_skips_mask_files(tmp_path):
     assert names == ["a.png", "b.tif"]
     project = Project(tmp_path)
     assert project.rels == ["a.png", "b.tif"]
+
+
+def test_channel_color_names_match_the_palette():
+    assert [color_name(color) for color in LAYER_PALETTE[:4]] == ["pink", "blue", "green", "yellow"]
+    assert color_name(None) == "hidden"
 
 
 def test_two_layers_keep_their_colors():

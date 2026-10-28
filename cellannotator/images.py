@@ -113,6 +113,37 @@ def hex_to_rgb(value: str) -> tuple[int, int, int]:
     return tuple(int(text[index : index + 2], 16) for index in (0, 2, 4))
 
 
+def color_name(value: str | None) -> str:
+    """A short name for a saved channel color, so a picker can say which stain it is."""
+    if not value:
+        return "hidden"
+    red, green, blue = hex_to_rgb(value)
+    spread = max(red, green, blue) - min(red, green, blue)
+    if spread < 28:
+        return "white" if red > 180 else "gray"
+    hue = ((green - blue) / spread) % 6 if red >= green and red >= blue else None
+    if hue is None and green >= red and green >= blue:
+        hue = 2 + (blue - red) / spread
+    if hue is None:
+        hue = 4 + (red - green) / spread
+    degrees = hue * 60
+    if 15 <= degrees < 45:
+        return "orange"
+    if 45 <= degrees < 70:
+        return "yellow"
+    if 70 <= degrees < 165:
+        return "green"
+    if 165 <= degrees < 200:
+        return "cyan"
+    if 200 <= degrees < 255:
+        return "blue"
+    if 255 <= degrees < 320:
+        return "purple"
+    if blue > green + 15:
+        return "pink"
+    return "red"
+
+
 def composite_layers(planes: list[np.ndarray], colors: list[str | None]) -> np.ndarray:
     """Add each visible layer, tinted by its color. None hides a layer."""
     height, width = planes[0].shape[:2]

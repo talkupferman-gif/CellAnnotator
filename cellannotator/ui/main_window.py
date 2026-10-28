@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from cellannotator.images import default_layer_colors, page_count, render_display, split_layers
+from cellannotator.images import color_name, default_layer_colors, page_count, render_display, split_layers
 from cellannotator.local_server import ensure_local_server
 from cellannotator.masks import delete_labels, merge_labels, split_label
 from cellannotator.meta import load_meta, meta_paths
@@ -310,14 +310,13 @@ class MainWindow(QMainWindow):
         self.diameter.setValue(30)
         self.diameter.setEnabled(False)
         self.auto_diameter.toggled.connect(lambda on: self.diameter.setEnabled(not on))
-        self.cyto = QSpinBox()
-        self.nucleus = QSpinBox()
-        for box in (self.cyto, self.nucleus):
-            box.setRange(0, 16)
+        self.cyto = QComboBox()
+        self.nucleus = QComboBox()
         note = QLabel(
             "cyto3 and nuclei are the built-in models. "
             "For one of your own, choose Custom weights and pick the file. "
-            "Layer numbers are the Cellpose channels: 0 is gray, 1 is the first layer."
+            "The main channel is the stain to segment. The nuclei channel is optional. "
+            "Each choice shows the color of that channel in this image."
         )
         note.setWordWrap(True)
         run = QPushButton("Run on this image")
@@ -337,12 +336,11 @@ class MainWindow(QMainWindow):
         row.addWidget(self.auto_diameter)
         row.addWidget(self.diameter)
         form.addLayout(row)
-        channels = QHBoxLayout()
-        channels.addWidget(QLabel("Layer"))
-        channels.addWidget(self.cyto)
-        channels.addWidget(QLabel("Second layer"))
-        channels.addWidget(self.nucleus)
-        form.addLayout(channels)
+        form.addWidget(QLabel("Main channel"))
+        form.addWidget(self.cyto)
+        form.addWidget(QLabel("Nuclei channel"))
+        form.addWidget(self.nucleus)
+        self._fill_channel_choices()
         buttons = QHBoxLayout()
         buttons.addWidget(run)
         buttons.addWidget(batch)
@@ -352,9 +350,36 @@ class MainWindow(QMainWindow):
             self.channel.addItem(label, data)
 
     def show_model_dialog(self) -> None:
+        self._fill_channel_choices()
         self.model_dialog.show()
         self.model_dialog.raise_()
         self.model_dialog.activateWindow()
+
+    def _layer_colors_for_model(self) -> list[str | None]:
+        if self.project is None or self.current_rel is None:
+            return default_layer_colors(3)
+        planes = split_layers(self.project.array_of(self.current_rel))
+        count = max(len(planes), 1)
+        colors = list(self.project.layer_colors or default_layer_colors(count))
+        if len(colors) < count:
+            colors.extend(default_layer_colors(count)[len(colors) :])
+        return colors[:count]
+
+    def _fill_channel_choices(self) -> None:
+        colors = self._layer_colors_for_model()
+        previous_main = self.cyto.currentData()
+        previous_nuclei = self.nucleus.currentData()
+        self.cyto.clear()
+        self.nucleus.clear()
+        self.cyto.addItem("Gray", 0)
+        self.nucleus.addItem("None", 0)
+        for index, color in enumerate(colors, start=1):
+            label = f"{index} · {color_name(color)}"
+            icon = _color_swatch(color)
+            self.cyto.addItem(icon, label, index)
+            self.nucleus.addItem(icon, label, index)
+        _select_data(self.cyto, 0 if previous_main is None else previous_main)
+        _select_data(self.nucleus, 0 if previous_nuclei is None else previous_nuclei)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -985,7 +1010,7 @@ class MainWindow(QMainWindow):
             warn(self, "Choose a weights file first.")
             return None
         diameter = None if self.auto_diameter.isChecked() else float(self.diameter.value())
-        channels = [self.cyto.value(), self.nucleus.value()]
+        channels = [int(self.cyto.currentData() or 0), int(self.nucleus.currentData() or 0)]
         model_name = "cyto3" if name == "Custom weights" else name
         return model_name, weights, diameter, channels
 
@@ -1317,6 +1342,17 @@ class MainWindow(QMainWindow):
             if answer == QMessageBox.Save:
                 self.save()
         super().closeEvent(event)
+
+
+def _color_swatch(color: str | None) -> QIcon:
+    pixmap = QPixmap(14, 14)
+    pixmap.fill(QColor(color or "#334155"))
+    return QIcon(pixmap)
+
+
+def _select_data(box: QComboBox, value) -> None:
+    index = box.findData(value)
+    box.setCurrentIndex(index if index >= 0 else 0)
 
 
 def _action(text: str, slot, primary: bool = False, name: str = "") -> QPushButton:
