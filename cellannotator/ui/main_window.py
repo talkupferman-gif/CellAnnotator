@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QDoubleSpinBox,
     QSpinBox,
     QStackedWidget,
     QToolBar,
@@ -33,7 +34,7 @@ from cellannotator.masks import delete_labels, merge_labels, split_label
 from cellannotator.meta import load_meta, meta_paths
 from cellannotator.project import Project
 from cellannotator.segment import ModelRunner
-from cellannotator.segio import seg_pair
+from cellannotator.segio import GRADE_MEANINGS, QUALITY_GRADES, seg_pair
 from cellannotator.settings import Settings
 from cellannotator.sync_client import SyncClient, SyncError
 from cellannotator.ui.canvas import Canvas
@@ -59,13 +60,16 @@ class ModelThread(QThread):
     failed = Signal(str)
     finished_all = Signal()
 
-    def __init__(self, jobs, model_name, weights, diameter, channels):
+    def __init__(self, jobs, model_name, weights, diameter, channels, flow_threshold, cellprob_threshold, min_size):
         super().__init__()
         self.jobs = jobs
         self.model_name = model_name
         self.weights = weights
         self.diameter = diameter
         self.channels = channels
+        self.flow_threshold = flow_threshold
+        self.cellprob_threshold = cellprob_threshold
+        self.min_size = min_size
         self.cancel = False
 
     def run(self) -> None:
@@ -80,11 +84,109 @@ class ModelThread(QThread):
                     weights=self.weights,
                     diameter=self.diameter,
                     channels=self.channels,
+                    flow_threshold=self.flow_threshold,
+                    cellprob_threshold=self.cellprob_threshold,
+                    min_size=self.min_size,
                 )
                 self.one.emit(relpath, masks)
             except Exception as exc:  # noqa: BLE001 - show the model error in the window
                 self.failed.emit(str(exc))
                 break
+        self.finished_all.emit()
+
+
+class TrainThread(QThread):
+    failed = Signal(str)
+    finished_ok = Signal(str)
+
+    def __init__(self, images, labels, model_name, weights, channels, save_to, n_epochs, learning_rate):
+        super().__init__()
+        self.images = images
+        self.labels = labels
+        self.model_name = model_name
+        self.weights = weights
+        self.channels = channels
+        self.save_to = save_to
+        self.n_epochs = n_epochs
+        self.learning_rate = learning_rate
+
+    def run(self) -> None:
+        try:
+            path = ModelRunner().train(
+                self.images,
+                self.labels,
+                model_name=self.model_name,
+                weights=self.weights,
+                channels=self.channels,
+                save_to=self.save_to,
+                n_epochs=self.n_epochs,
+                learning_rate=self.learning_rate,
+            )
+        except Exception as exc:  # noqa: BLE001 - show the training error in the window
+            self.failed.emit(str(exc))
+            return
+        self.finished_ok.emit(path)
+
+
+class RankTrainThread(QThread):
+    failed = Signal(str)
+    finished_ok = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, images, labels, qualities, channels, save_to, n_epochs, learning_rate):
+        super().__init__()
+        self.images = images
+        self.labels = labels
+        self.qualities = qualities
+        self.channels = channels
+        self.save_to = save_to
+        self.n_epochs = n_epochs
+        self.learning_rate = learning_rate
+
+    def run(self) -> None:
+        try:
+            from cellannotator.ranktrain import train_from_rankings
+
+            path = train_from_rankings(
+                self.images,
+                self.labels,
+                self.qualities,
+                channels=self.channels,
+                save_to=self.save_to,
+                n_epochs=self.n_epochs,
+                learning_rate=self.learning_rate,
+                on_epoch=self.progress.emit,
+            )
+        except Exception as exc:  # noqa: BLE001 - show the training error in the window
+            self.failed.emit(str(exc))
+            return
+        self.finished_ok.emit(path)
+
+
+class RankRunThread(QThread):
+    one = Signal(str, object)
+    failed = Signal(str)
+    finished_all = Signal()
+
+    def __init__(self, jobs, checkpoint: str):
+        super().__init__()
+        self.jobs = jobs
+        self.checkpoint = checkpoint
+
+    def run(self) -> None:
+        try:
+            from cellannotator.ranktrain import run_ranking_model
+        except Exception as exc:  # noqa: BLE001 - show the import error in the window
+            self.failed.emit(str(exc))
+            self.finished_all.emit()
+            return
+        for relpath, image in self.jobs:
+            try:
+                masks = run_ranking_model(image, self.checkpoint)
+            except Exception as exc:  # noqa: BLE001 - show the model error in the window
+                self.failed.emit(str(exc))
+                break
+            self.one.emit(relpath, masks)
         self.finished_all.emit()
 
 
@@ -100,7 +202,8 @@ class MainWindow(QMainWindow):
         self.active_link_id: str | None = None
         self.scores: dict[str, int | None] = {}
         self.weights_path: str | None = None
-        self._thread: ModelThread | None = None
+        self.rank_weights_path: str | None = None
+        self._thread: QThread | None = None
         self._showing_score = False
         self._asked_login = False
         self.member_role: str | None = None
@@ -114,6 +217,7 @@ class MainWindow(QMainWindow):
         self.canvas.edited.connect(self._on_edited)
         self.canvas.labelsTouched.connect(self._on_labels)
         self.canvas.status.connect(self.statusBar().showMessage)
+        self.canvas.selectionChanged.connect(self._sync_quality_buttons)
         self.setStyleSheet(_STYLE)
         self._build_model_dialog()
         self._build_image_dock()
@@ -122,7 +226,8 @@ class MainWindow(QMainWindow):
 
         hint = QLabel(
             "Right-click and close the loop. Draw fills a cell. Erase cuts inside the loop. "
-            "X shows the image alone. Z shows outlines. The menu has images, ranking, colors, models, and versions."
+            "Click a cell, then use Quality 1 through 5. "
+            "X shows the image alone. Z shows outlines."
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
@@ -167,6 +272,17 @@ class MainWindow(QMainWindow):
         modes.addButton(self.erase_button)
         self.draw_button.clicked.connect(lambda: self.canvas.set_mode("draw"))
         self.erase_button.clicked.connect(lambda: self.canvas.set_mode("erase"))
+        self.quality_group = QButtonGroup(self)
+        self.quality_group.setExclusive(True)
+        self.quality_buttons = []
+        for value in QUALITY_GRADES:
+            button = QPushButton(str(value))
+            button.setCheckable(True)
+            button.setToolTip(GRADE_MEANINGS[value])
+            button.setEnabled(False)
+            button.clicked.connect(lambda _checked=False, rating=value: self._set_quality(rating))
+            self.quality_group.addButton(button)
+            self.quality_buttons.append(button)
         bar = QToolBar("Annotate")
         bar.setObjectName("annotate")
         bar.setMovable(False)
@@ -180,6 +296,13 @@ class MainWindow(QMainWindow):
             _action("Redo", self.redo),
         ):
             bar.addWidget(widget)
+        bar.addSeparator()
+        quality_label = QLabel("Quality")
+        quality_label.setObjectName("hint")
+        quality_label.setToolTip("Click a cell, then choose a grade from 1 to 5")
+        bar.addWidget(quality_label)
+        for button in self.quality_buttons:
+            bar.addWidget(button)
         self.addToolBar(bar)
         bar.hide()
         self.toolbar = bar
@@ -228,6 +351,9 @@ class MainWindow(QMainWindow):
 
         model_menu = menu.addMenu("Model")
         model_menu.addAction("Run model…", self.show_model_dialog)
+        model_menu.addAction("Train model…", self.train_model)
+        model_menu.addAction("Train from rankings…", self.train_from_rankings)
+        model_menu.addAction("Run ranking model", self.run_ranking_model)
         model_menu.addAction("Run on this image", self.run_current)
         model_menu.addAction("Run batch", self.run_batch)
 
@@ -340,6 +466,25 @@ class MainWindow(QMainWindow):
         form.addWidget(self.cyto)
         form.addWidget(QLabel("Nuclei channel"))
         form.addWidget(self.nucleus)
+        self.flow_threshold = QDoubleSpinBox()
+        self.flow_threshold.setRange(0, 3)
+        self.flow_threshold.setDecimals(2)
+        self.flow_threshold.setSingleStep(0.1)
+        self.flow_threshold.setValue(0.4)
+        self.cellprob_threshold = QDoubleSpinBox()
+        self.cellprob_threshold.setRange(-6, 6)
+        self.cellprob_threshold.setDecimals(1)
+        self.cellprob_threshold.setSingleStep(0.1)
+        self.cellprob_threshold.setValue(0.0)
+        self.min_size = QSpinBox()
+        self.min_size.setRange(0, 5000)
+        self.min_size.setValue(15)
+        form.addWidget(QLabel("Flow threshold"))
+        form.addWidget(self.flow_threshold)
+        form.addWidget(QLabel("Cell probability"))
+        form.addWidget(self.cellprob_threshold)
+        form.addWidget(QLabel("Minimum size"))
+        form.addWidget(self.min_size)
         self._fill_channel_choices()
         buttons = QHBoxLayout()
         buttons.addWidget(run)
@@ -901,8 +1046,10 @@ class MainWindow(QMainWindow):
             return
         session.masks = updated
         session.set_manual(label, True)
+        parent_quality = session.quality_of(label)
         for new_label in created:
             session.set_manual(new_label, True)
+            session.set_quality(new_label, parent_quality)
         session.dirty = True
         self.canvas.refresh()
         self.statusBar().showMessage(f"Split off {len(created)} piece(s)")
@@ -934,6 +1081,34 @@ class MainWindow(QMainWindow):
             self.canvas.refresh()
             self._apply_link_colors()
             self.statusBar().showMessage("Redid the edit")
+
+    def _sync_quality_buttons(self) -> None:
+        session = self.canvas.session
+        selected = self.canvas.selected
+        visible = bool(selected) and session is not None
+        ratings = [session.quality_of(label) for label in selected] if visible else []
+        same = len(set(ratings)) == 1 and ratings[0] in QUALITY_GRADES
+        self.quality_group.setExclusive(False)
+        for button, value in zip(self.quality_buttons, QUALITY_GRADES):
+            button.setEnabled(visible)
+            button.blockSignals(True)
+            button.setChecked(bool(visible and same and value == ratings[0]))
+            button.blockSignals(False)
+        self.quality_group.setExclusive(True)
+
+    def _set_quality(self, rating: int) -> None:
+        session = self.canvas.session
+        if session is None or not self.canvas.selected:
+            return
+        if all(session.quality_of(label) == rating for label in self.canvas.selected):
+            self._sync_quality_buttons()
+            return
+        session.checkpoint()
+        for label in self.canvas.selected:
+            session.set_quality(label, rating)
+        session.dirty = True
+        self.canvas.refresh()
+        self.statusBar().showMessage(f"Quality {rating} on the selected cells")
 
     def same_cell(self) -> None:
         if self.project is None or self.project.meta.kind != "zstack" or self.current_rel is None:
@@ -1012,7 +1187,312 @@ class MainWindow(QMainWindow):
         diameter = None if self.auto_diameter.isChecked() else float(self.diameter.value())
         channels = [int(self.cyto.currentData() or 0), int(self.nucleus.currentData() or 0)]
         model_name = "cyto3" if name == "Custom weights" else name
-        return model_name, weights, diameter, channels
+        return (
+            model_name,
+            weights,
+            diameter,
+            channels,
+            float(self.flow_threshold.value()),
+            float(self.cellprob_threshold.value()),
+            int(self.min_size.value()),
+        )
+
+    def train_model(self) -> None:
+        if self.project is None:
+            warn(self, "Open a folder before training.")
+            return
+        if self._thread is not None:
+            warn(self, "Wait until the current model finishes.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Train model")
+        dialog.setMinimumWidth(440)
+        model = QComboBox()
+        model.addItems(["cyto3", "nuclei", "Custom weights"])
+        if self.model.currentText():
+            model.setCurrentText(self.model.currentText())
+        chosen_weights = {"path": self.weights_path}
+        weights_name = QLabel(Path(self.weights_path).name if self.weights_path else "No weights file")
+        weights_name.setObjectName("hint")
+
+        def pick_weights() -> None:
+            path, _selected = QFileDialog.getOpenFileName(dialog, "Starting weights")
+            if not path:
+                return
+            chosen_weights["path"] = path
+            model.setCurrentText("Custom weights")
+            weights_name.setText(Path(path).name)
+
+        weights_button = QPushButton("Starting weights")
+        weights_button.clicked.connect(pick_weights)
+        main_channel = QComboBox()
+        nuclei_channel = QComboBox()
+        self._fill_named_channels(main_channel, "Gray", self.cyto.currentData())
+        self._fill_named_channels(nuclei_channel, "None", self.nucleus.currentData())
+        epochs = QSpinBox()
+        epochs.setRange(1, 2000)
+        epochs.setValue(100)
+        learning_rate = QDoubleSpinBox()
+        learning_rate.setRange(0.0001, 1.0)
+        learning_rate.setDecimals(4)
+        learning_rate.setSingleStep(0.01)
+        learning_rate.setValue(0.2)
+        save_to = {"path": ""}
+        save_name = QLabel("No file chosen")
+        save_name.setObjectName("hint")
+        save_name.setWordWrap(True)
+
+        def pick_save() -> None:
+            path, _selected = QFileDialog.getSaveFileName(dialog, "New weights file", "cellpose_finetune")
+            if not path:
+                return
+            save_to["path"] = path
+            save_name.setText(path)
+
+        save_button = QPushButton("Save new weights as")
+        save_button.clicked.connect(pick_save)
+        note = QLabel(
+            "Fine-tune the starting model on the images you pick. Every mask in those images is used. "
+            "Star ratings are saved on each cell and are not used in this training run. "
+            "Cellpose writes the file into a models folder beside the place you choose."
+        )
+        note.setWordWrap(True)
+        form = QVBoxLayout(dialog)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(8)
+        form.addWidget(note)
+        form.addWidget(QLabel("Starting model"))
+        form.addWidget(model)
+        form.addWidget(weights_button)
+        form.addWidget(weights_name)
+        form.addWidget(QLabel("Main channel"))
+        form.addWidget(main_channel)
+        form.addWidget(QLabel("Nuclei channel"))
+        form.addWidget(nuclei_channel)
+        form.addWidget(QLabel("Epochs"))
+        form.addWidget(epochs)
+        form.addWidget(QLabel("Learning rate"))
+        form.addWidget(learning_rate)
+        form.addWidget(save_button)
+        form.addWidget(save_name)
+        buttons = QHBoxLayout()
+        start = QPushButton("Choose images")
+        start.setObjectName("primary")
+        cancel = QPushButton("Cancel")
+        start.clicked.connect(dialog.accept)
+        cancel.clicked.connect(dialog.reject)
+        buttons.addWidget(start)
+        buttons.addWidget(cancel)
+        form.addLayout(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = model.currentText()
+        weights = chosen_weights["path"] if name == "Custom weights" else None
+        if name == "Custom weights" and not weights:
+            warn(self, "Choose a weights file to fine-tune.")
+            return
+        if not save_to["path"]:
+            warn(self, "Choose where to save the new weights.")
+            return
+        picker = BatchDialog(self.project.rels, self.current_rel, self, "Train on these images")
+        if picker.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = picker.chosen()
+        if not chosen:
+            return
+        self._flush_current()
+        images = []
+        labels = []
+        skipped = []
+        for relpath in chosen:
+            session = self.project.load_session(relpath)
+            if int(session.masks.max()) <= 0:
+                skipped.append(relpath)
+                continue
+            images.append(self.project.array_of(relpath))
+            labels.append(np.asarray(session.masks))
+        if skipped:
+            self.statusBar().showMessage("Skipped images with no cells: " + ", ".join(skipped[:8]))
+        if not images:
+            warn(self, "None of those images have cells to train on.")
+            return
+        channels = [int(main_channel.currentData() or 0), int(nuclei_channel.currentData() or 0)]
+        model_name = "cyto3" if name == "Custom weights" else name
+        self._thread = TrainThread(
+            images,
+            labels,
+            model_name,
+            weights,
+            channels,
+            save_to["path"],
+            int(epochs.value()),
+            float(learning_rate.value()),
+        )
+        self._thread.failed.connect(lambda message: warn(self, message))
+        self._thread.finished_ok.connect(self._train_ready)
+        self._thread.finished.connect(self._model_finished)
+        self.statusBar().showMessage("Training… this can take a while")
+        self._thread.start()
+
+    def _fill_named_channels(self, box: QComboBox, empty_label: str, previous) -> None:
+        box.clear()
+        box.addItem(empty_label, 0)
+        for index, color in enumerate(self._layer_colors_for_model(), start=1):
+            box.addItem(_color_swatch(color), f"{index} · {color_name(color)}", index)
+        _select_data(box, 0 if previous is None else previous)
+
+    def _train_ready(self, path: str) -> None:
+        self.weights_path = path
+        self.model.setCurrentText("Custom weights")
+        self.weights_name.setText(Path(path).name)
+        info(self, f"Training finished. Run model now uses these weights.\n{path}")
+        self.statusBar().showMessage(f"New weights: {Path(path).name}")
+
+    def train_from_rankings(self) -> None:
+        if self.project is None:
+            warn(self, "Open a folder before training.")
+            return
+        if self._thread is not None:
+            warn(self, "Wait until the current model finishes.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Train from rankings")
+        dialog.setMinimumWidth(440)
+        main_channel = QComboBox()
+        nuclei_channel = QComboBox()
+        self._fill_named_channels(main_channel, "Gray", self.cyto.currentData())
+        self._fill_named_channels(nuclei_channel, "None", self.nucleus.currentData())
+        epochs = QSpinBox()
+        epochs.setRange(1, 2000)
+        epochs.setValue(100)
+        learning_rate = QDoubleSpinBox()
+        learning_rate.setRange(0.00001, 0.1)
+        learning_rate.setDecimals(5)
+        learning_rate.setSingleStep(0.0001)
+        learning_rate.setValue(0.0001)
+        save_to = {"path": ""}
+        save_name = QLabel("No file chosen")
+        save_name.setObjectName("hint")
+        save_name.setWordWrap(True)
+
+        def pick_save() -> None:
+            path, _selected = QFileDialog.getSaveFileName(
+                dialog, "New ranking weights", "ranking_model.pt", "Ranking weights (*.pt)"
+            )
+            if not path:
+                return
+            save_to["path"] = path
+            save_name.setText(path)
+
+        save_button = QPushButton("Save new weights as")
+        save_button.clicked.connect(pick_save)
+        note = QLabel(
+            "5 and 4 teach the full mask, and 5 teaches it the most. "
+            "3 teaches that a cell is there without copying the incomplete outline. "
+            "2 and ungraded cells are left out. 1 punishes that mask. "
+            "This is separate from Cellpose training and needs a CUDA GPU. "
+            "The encoder learns at one tenth of the learning rate."
+        )
+        note.setWordWrap(True)
+        form = QVBoxLayout(dialog)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(8)
+        form.addWidget(note)
+        form.addWidget(QLabel("Main channel"))
+        form.addWidget(main_channel)
+        form.addWidget(QLabel("Nuclei channel"))
+        form.addWidget(nuclei_channel)
+        form.addWidget(QLabel("Epochs"))
+        form.addWidget(epochs)
+        form.addWidget(QLabel("Learning rate"))
+        form.addWidget(learning_rate)
+        form.addWidget(save_button)
+        form.addWidget(save_name)
+        buttons = QHBoxLayout()
+        start = QPushButton("Choose images")
+        start.setObjectName("primary")
+        cancel = QPushButton("Cancel")
+        start.clicked.connect(dialog.accept)
+        cancel.clicked.connect(dialog.reject)
+        buttons.addWidget(start)
+        buttons.addWidget(cancel)
+        form.addLayout(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if not save_to["path"]:
+            warn(self, "Choose where to save the new weights.")
+            return
+        picker = BatchDialog(self.project.rels, self.current_rel, self, "Train on these images")
+        if picker.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = picker.chosen()
+        if not chosen:
+            return
+        self._flush_current()
+        from cellannotator.ranktrain import image_can_train
+
+        images = []
+        labels = []
+        qualities = []
+        skipped = []
+        for relpath in chosen:
+            session = self.project.load_session(relpath)
+            if not image_can_train(session.masks, session.quality):
+                skipped.append(relpath)
+                continue
+            images.append(self.project.array_of(relpath))
+            labels.append(np.asarray(session.masks))
+            qualities.append(np.asarray(session.quality))
+        if skipped:
+            self.statusBar().showMessage("Skipped images with nothing to learn from: " + ", ".join(skipped[:8]))
+        if not images:
+            warn(self, "None of those images have a grade to train on. Use 1, 3, 4, or 5.")
+            return
+        channels = [int(main_channel.currentData() or 0), int(nuclei_channel.currentData() or 0)]
+        self._thread = RankTrainThread(
+            images,
+            labels,
+            qualities,
+            channels,
+            save_to["path"],
+            int(epochs.value()),
+            float(learning_rate.value()),
+        )
+        self._thread.failed.connect(lambda message: warn(self, message))
+        self._thread.progress.connect(self.statusBar().showMessage)
+        self._thread.finished_ok.connect(self._rank_ready)
+        self._thread.finished.connect(self._model_finished)
+        self.statusBar().showMessage(
+            "Training from rankings. 5 and 4 teach the mask, 5 the most. "
+            "3 teaches the cell without its outline. 2 is skipped. 1 is punished."
+        )
+        self._thread.start()
+
+    def _rank_ready(self, path: str) -> None:
+        self.rank_weights_path = path
+        info(self, f"Ranking model finished.\n{path}")
+        self.statusBar().showMessage(f"Ranking weights: {Path(path).name}")
+
+    def run_ranking_model(self) -> None:
+        if self.project is None or self.current_rel is None:
+            warn(self, "Open an image first. Use the menu, then Image, then Images and ranking.")
+            return
+        if self._thread is not None:
+            warn(self, "Wait until the current model finishes.")
+            return
+        path = self.rank_weights_path
+        if not path:
+            path, _selected = QFileDialog.getOpenFileName(self, "Ranking weights", "", "Ranking weights (*.pt)")
+        if not path:
+            return
+        self.rank_weights_path = path
+        jobs = [(self.current_rel, self.project.array_of(self.current_rel))]
+        self._thread = RankRunThread(jobs, path)
+        self._thread.one.connect(self._apply_model)
+        self._thread.failed.connect(lambda message: warn(self, message))
+        self._thread.finished_all.connect(self._model_finished)
+        self.statusBar().showMessage("Running ranking model…")
+        self._thread.start()
 
     def run_current(self) -> None:
         if self.project is None or self.current_rel is None:
@@ -1058,7 +1538,9 @@ class MainWindow(QMainWindow):
             return
         session.checkpoint()
         session.masks = masks
-        session.ismanual = np.zeros(int(session.masks.max()), dtype=bool)
+        count = int(session.masks.max())
+        session.ismanual = np.zeros(count, dtype=bool)
+        session.quality = np.full(count, 3, dtype=np.uint8)
         session.dirty = True
         self.project.meta.drop_slice(relpath)
         self.project.write_working(relpath, session)
@@ -1067,7 +1549,7 @@ class MainWindow(QMainWindow):
             self.canvas.selected.clear()
             self.canvas.refresh()
             self._apply_link_colors()
-        self.statusBar().showMessage(f"Model masks are in the working copy for {relpath}")
+        self.statusBar().showMessage(f"Model masks are in the working copy for {relpath}, graded 3")
 
     def _model_finished(self) -> None:
         self._thread = None
@@ -1398,6 +1880,7 @@ QPushButton, QToolButton {
 }
 QPushButton:hover, QToolButton:hover { background: #3B4C63; }
 QPushButton:checked, QToolButton:checked { background: #22C55E; color: #052E16; border-color: #22C55E; }
+QPushButton:disabled, QToolButton:disabled { color: #94A3B8; background: #1E293B; }
 QToolButton#erase:checked { background: #EF4444; color: #FFFFFF; border-color: #EF4444; }
 QPushButton#primary { background: #22C55E; color: #052E16; border: none; font-weight: 700; }
 QPushButton#primary:hover { background: #4ADE80; }

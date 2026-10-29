@@ -1,4 +1,4 @@
-"""Run a Cellpose model. Training is intentionally not implemented yet."""
+"""Run and fine-tune a Cellpose 3 model."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ BUILTIN_MODELS = ("cyto3", "nuclei", "cyto2", "cyto")
 
 
 class ModelRunner:
-    """One place the canvas asks for masks. A later training command can sit beside ``run``."""
+    """One place the canvas asks for masks, and for a fine-tune of those masks."""
 
     def run(
         self,
@@ -22,6 +22,9 @@ class ModelRunner:
         weights: str | None = None,
         diameter: float | None = None,
         channels: list[int] | None = None,
+        flow_threshold: float = 0.4,
+        cellprob_threshold: float = 0.0,
+        min_size: int = 15,
     ) -> np.ndarray:
         try:
             from cellpose import models
@@ -40,7 +43,12 @@ class ModelRunner:
             )
         try:
             model = _build_model(models, _gpu_available(), pretrained)
-            kwargs = {"channels": list(channels or [0, 0])}
+            kwargs = {
+                "channels": list(channels or [0, 0]),
+                "flow_threshold": float(flow_threshold),
+                "cellprob_threshold": float(cellprob_threshold),
+                "min_size": int(min_size),
+            }
             if prepared.ndim == 3:
                 kwargs["channel_axis"] = -1
             if diameter is not None:
@@ -61,6 +69,81 @@ class ModelRunner:
                 f"Cellpose returned masks of size {masks.shape}, but the image is {prepared.shape[:2]}"
             )
         return masks.astype(np.int32)
+
+    def train(
+        self,
+        images: list[np.ndarray],
+        labels: list[np.ndarray],
+        model_name: str = "cyto3",
+        weights: str | None = None,
+        channels: list[int] | None = None,
+        save_to: str = "",
+        n_epochs: int = 100,
+        learning_rate: float = 0.2,
+    ) -> str:
+        """Fine-tune a Cellpose 3 model. Quality ratings are not read here."""
+        try:
+            from cellpose import models
+            from cellpose import train as cellpose_train
+        except ImportError as exc:
+            raise RuntimeError(
+                "Cellpose is not installed. From the project folder run: "
+                ".\\.venv\\Scripts\\python.exe -m pip install \"cellpose>=3.1,<4\""
+            ) from exc
+
+        prepared, train_labels = training_examples(images, labels)
+        pretrained = resolve_pretrained(model_name, weights)
+        if Path(pretrained).is_file() and _is_cellpose4_file(pretrained):
+            raise RuntimeError(
+                "That file is a Cellpose 4 model. This app trains Cellpose 3 so your own models still open."
+            )
+        destination = Path(save_to)
+        if not destination.name:
+            raise RuntimeError("Choose a file name for the new weights.")
+        if destination.parent.name == "models":
+            save_path = destination.parent.parent
+        else:
+            save_path = destination.parent
+        try:
+            model = _build_trainable(models, _gpu_available(), pretrained)
+            channel_axis = -1 if prepared[0].ndim == 3 else None
+            saved, _losses = cellpose_train.train_seg(
+                model.net,
+                train_data=prepared,
+                train_labels=train_labels,
+                channels=list(channels or [0, 0]),
+                channel_axis=channel_axis,
+                min_train_masks=1,
+                save_path=str(save_path),
+                nimg_per_epoch=max(8, len(prepared)),
+                learning_rate=float(learning_rate),
+                n_epochs=int(n_epochs),
+                SGD=True,
+                model_name=destination.name,
+            )[:2]
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError("Could not train that Cellpose model. " + str(exc)) from exc
+        return str(saved)
+
+
+def training_examples(images: list[np.ndarray], labels: list[np.ndarray]) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Keep every mask in images that have cells. Quality is not consulted."""
+    prepared: list[np.ndarray] = []
+    kept: list[np.ndarray] = []
+    for image, label in zip(images, labels):
+        masks = np.asarray(label)
+        if masks.size == 0 or int(masks.max()) <= 0:
+            continue
+        prepared.append(image_for_model(image))
+        kept.append(masks.astype(np.int32))
+    if not prepared:
+        raise RuntimeError("None of those images have cells to train on.")
+    channel_counts = {image.shape[-1] if image.ndim == 3 else 1 for image in prepared}
+    if len(channel_counts) > 1:
+        raise RuntimeError("Train on images that all have the same number of channels.")
+    return prepared, kept
 
 
 def resolve_pretrained(model_name: str, weights: str | None) -> str:
@@ -110,6 +193,12 @@ def _build_model(models, gpu: bool, pretrained: str):
     if Path(pretrained).is_file():
         return models.CellposeModel(gpu=gpu, pretrained_model=pretrained)
     return models.Cellpose(gpu=gpu, model_type=pretrained)
+
+
+def _build_trainable(models, gpu: bool, pretrained: str):
+    if Path(pretrained).is_file():
+        return models.CellposeModel(gpu=gpu, pretrained_model=pretrained)
+    return models.CellposeModel(gpu=gpu, model_type=pretrained)
 
 
 def weights_label(path: str | None) -> str:

@@ -6,8 +6,8 @@ import hashlib
 import math
 
 import numpy as np
-from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QWheelEvent
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
 from cellannotator.masks import add_closed_outline, erase_closed_outline, interior_outline
@@ -28,6 +28,18 @@ OUTLINE_COLORS = (
     (99, 230, 190),
     (255, 169, 77),
 )
+
+
+def _quality_colors(rating: int) -> tuple[QColor, QColor]:
+    fills = {
+        5: ("#052E16", "#22C55E"),
+        4: ("#14532D", "#86EFAC"),
+        3: ("#78350F", "#FCD34D"),
+        2: ("#1E293B", "#F8FAFC"),
+        1: ("#450A0A", "#FCA5A5"),
+    }
+    fill, ink = fills.get(rating, ("#1E293B", "#F8FAFC"))
+    return QColor(fill), QColor(ink)
 
 
 def rgb_for_key(key: str) -> tuple[int, int, int]:
@@ -51,6 +63,7 @@ class Canvas(QWidget):
     edited = Signal()
     labelsTouched = Signal(object)
     status = Signal(str)
+    selectionChanged = Signal()
 
     def __init__(self):
         super().__init__()
@@ -90,6 +103,7 @@ class Canvas(QWidget):
         self.color_keys = {}
         self._rebuild_overlay()
         self.fit()
+        self.selectionChanged.emit()
 
     def set_color_keys(self, keys: dict[int, str]) -> None:
         self.color_keys = dict(keys)
@@ -105,6 +119,7 @@ class Canvas(QWidget):
         self.selected = {label for label in self.selected if self.session is not None and (self.session.masks == label).any()}
         self._rebuild_overlay()
         self.update()
+        self.selectionChanged.emit()
 
     def fit(self) -> None:
         if self.session is None or self.width() < 2 or self.height() < 2:
@@ -199,6 +214,7 @@ class Canvas(QWidget):
             radius = self._close_distance()
             start = self._stroke[0]
             painter.drawEllipse(QPointF(*start), radius, radius)
+        self._paint_quality(painter)
         painter.end()
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
@@ -319,11 +335,13 @@ class Canvas(QWidget):
         else:
             self.session.masks = updated
             self.session.set_manual(label, True)
+            self.session.set_quality(label, 5)
             self.session.dirty = True
             self.selected = {label}
             self.labelsTouched.emit({label})
             self.edited.emit()
-            self.status.emit(f"Added cell {label}")
+            self.status.emit(f"Added cell {label} at grade 5")
+            self.selectionChanged.emit()
         self._rebuild_overlay()
         self.update()
 
@@ -343,5 +361,38 @@ class Canvas(QWidget):
             self.selected = {label} if label else set()
         self._rebuild_overlay()
         names = ", ".join(str(item) for item in sorted(self.selected)) or "none"
-        self.status.emit(f"Selected {names}")
+        extra = ""
+        if len(self.selected) == 1 and self.session is not None:
+            rating = self.session.quality_of(next(iter(self.selected)))
+            extra = f" · quality {rating}" if rating else " · set Quality 1 through 5"
+        self.status.emit(f"Selected {names}{extra}")
+        self.selectionChanged.emit()
         self.update()
+
+    def _paint_quality(self, painter: QPainter) -> None:
+        if self.session is None or not self.masks_visible:
+            return
+        masks = self.session.masks
+        labels = [int(value) for value in np.unique(masks) if int(value) > 0]
+        if not labels:
+            return
+        font = QFont("Segoe UI")
+        font.setPixelSize(max(8, int(round(14 / max(self._zoom, 0.02)))))
+        painter.setFont(font)
+        for label in labels:
+            rating = self.session.quality_of(label)
+            if not rating:
+                continue
+            rows, columns = np.nonzero(masks == label)
+            if rows.size == 0:
+                continue
+            center = QPointF(float(columns.mean()), float(rows.mean()))
+            radius = 12.0 / max(self._zoom, 0.02)
+            fill, ink = _quality_colors(rating)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(fill)
+            painter.drawEllipse(center, radius, radius)
+            painter.setPen(ink)
+            span = radius * 2
+            rect = QRectF(center.x() - radius, center.y() - radius, span, span)
+            painter.drawText(rect, Qt.AlignCenter, str(rating))

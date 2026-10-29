@@ -138,9 +138,9 @@ class HistoryDialog(QDialog):
 
 
 class BatchDialog(QDialog):
-    def __init__(self, relpaths: list[str], current: str | None, parent=None):
+    def __init__(self, relpaths: list[str], current: str | None, parent=None, title: str = "Run the model on images"):
         super().__init__(parent)
-        self.setWindowTitle("Run the model on images")
+        self.setWindowTitle(title)
         self.setMinimumSize(420, 360)
         layout = QVBoxLayout(self)
         self.list = QListWidget()

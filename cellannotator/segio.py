@@ -10,7 +10,27 @@ import numpy as np
 from cellannotator.masks import edge_mask
 
 
-OWNED_KEYS = {"outlines", "masks", "chan_choose", "ismanual", "filename", "flows", "diameter", "readiness"}
+QUALITY_GRADES = (1, 2, 3, 4, 5)
+GRADE_MEANINGS = {
+    1: "Punish this mask. The model is pushed not to create it.",
+    2: "Do not learn from this mask.",
+    3: "A cell is under this mask, but the shape is incomplete.",
+    4: "An okay mask. Its shape can be learned.",
+    5: "A perfect mask. Train on it the most.",
+}
+
+
+OWNED_KEYS = {
+    "outlines",
+    "masks",
+    "chan_choose",
+    "ismanual",
+    "quality",
+    "filename",
+    "flows",
+    "diameter",
+    "readiness",
+}
 
 
 def seg_pair(image_path: Path) -> tuple[Path, Path]:
@@ -32,6 +52,7 @@ class MaskSession:
         self.masks = np.asarray(masks, dtype=np.int32)
         self.filename = filename
         self.ismanual = np.zeros(int(self.masks.max()), dtype=bool)
+        self.quality = np.zeros(int(self.masks.max()), dtype=np.uint8)
         self.chan_choose = [0, 0]
         self.flows = None
         self.diameter = float("nan")
@@ -39,8 +60,8 @@ class MaskSession:
         self.extras: dict = {}
         self.dirty = False
         self.warning = ""
-        self._undo: list[tuple[np.ndarray, np.ndarray]] = []
-        self._redo: list[tuple[np.ndarray, np.ndarray]] = []
+        self._undo: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        self._redo: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
     @classmethod
     def empty(cls, height: int, width: int, filename: str = "") -> MaskSession:
@@ -62,8 +83,32 @@ class MaskSession:
             grown[: self.ismanual.size] = self.ismanual
             self.ismanual = grown
 
+    def quality_of(self, label: int) -> int:
+        index = label - 1
+        if label <= 0 or index >= self.quality.size:
+            return 0
+        return int(self.quality[index])
+
+    def set_quality(self, label: int, value: int) -> None:
+        if label <= 0:
+            return
+        rating = int(value)
+        if rating not in (0, *QUALITY_GRADES):
+            raise ValueError("Quality is 1, 2, 3, 4, or 5")
+        self._grow_quality(label)
+        self.quality[label - 1] = rating
+
+    def _grow_quality(self, label: int) -> None:
+        if self.quality.size < label:
+            grown = np.zeros(label, dtype=np.uint8)
+            grown[: self.quality.size] = self.quality
+            self.quality = grown
+
+    def _snapshot(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return (self.masks.copy(), self.ismanual.copy(), self.quality.copy())
+
     def checkpoint(self) -> None:
-        self._undo.append((self.masks.copy(), self.ismanual.copy()))
+        self._undo.append(self._snapshot())
         self._redo.clear()
         if len(self._undo) > 30:
             self._undo.pop(0)
@@ -71,16 +116,16 @@ class MaskSession:
     def undo(self) -> bool:
         if not self._undo:
             return False
-        self._redo.append((self.masks.copy(), self.ismanual.copy()))
-        self.masks, self.ismanual = self._undo.pop()
+        self._redo.append(self._snapshot())
+        self.masks, self.ismanual, self.quality = self._undo.pop()
         self.dirty = True
         return True
 
     def redo(self) -> bool:
         if not self._redo:
             return False
-        self._undo.append((self.masks.copy(), self.ismanual.copy()))
-        self.masks, self.ismanual = self._redo.pop()
+        self._undo.append(self._snapshot())
+        self.masks, self.ismanual, self.quality = self._redo.pop()
         self.dirty = True
         return True
 
@@ -92,15 +137,19 @@ class MaskSession:
         outlines = self.masks * edge_mask(self.masks)
         limit = int(self.masks.max())
         manual = np.zeros(limit, dtype=bool)
+        quality = np.zeros(limit, dtype=np.uint8)
         if limit:
             copy_n = min(limit, self.ismanual.size)
             manual[:copy_n] = self.ismanual[:copy_n]
+            quality_n = min(limit, self.quality.size)
+            quality[:quality_n] = self.quality[:quality_n]
         width = np.uint16 if max(int(self.masks.max()), int(outlines.max() if outlines.size else 0)) < 2**16 - 1 else np.uint32
         payload = {
             "outlines": outlines.astype(width),
             "masks": self.masks.astype(width),
             "chan_choose": list(self.chan_choose),
             "ismanual": manual,
+            "quality": quality,
             "filename": self.filename,
             "flows": self.flows if self.flows is not None else [],
             "diameter": self.diameter,
@@ -130,6 +179,9 @@ def load_session(path: Path, shape: tuple[int, int], filename: str = "") -> Mask
     manual = np.asarray(data.get("ismanual", []), dtype=bool).reshape(-1)
     session.ismanual = manual
     session._grow_manual(int(session.masks.max()))
+    quality = np.asarray(data.get("quality", []), dtype=np.int32).reshape(-1)
+    session.quality = np.clip(quality, 0, max(QUALITY_GRADES)).astype(np.uint8)
+    session._grow_quality(int(session.masks.max()))
     channels = data.get("chan_choose", [0, 0])
     try:
         values = [int(value) for value in list(channels)]

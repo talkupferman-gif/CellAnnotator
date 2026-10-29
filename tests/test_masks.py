@@ -58,12 +58,44 @@ def test_closed_erase_cuts_only_the_inside():
 def test_undo_then_redo_restores_the_edit():
     session = MaskSession.empty(4, 4)
     session.masks[0, 0] = 1
+    session.set_quality(1, 2)
     session.checkpoint()
     session.masks[0, 0] = 2
+    session.set_quality(1, 3)
     assert session.undo()
     assert session.masks[0, 0] == 1
+    assert session.quality_of(1) == 2
     assert session.redo()
     assert session.masks[0, 0] == 2
+    assert session.quality_of(1) == 3
+
+
+def test_quality_grades_four_and_five_round_trip(tmp_path):
+    from cellannotator.segio import load_session, save_session
+
+    session = MaskSession.empty(6, 6, "cell.tif")
+    session.masks[1, 1] = 1
+    session.masks[2, 2] = 2
+    session.set_quality(1, 4)
+    session.set_quality(2, 5)
+    path = tmp_path / "cell_seg.npy"
+    save_session(path, session)
+    loaded = load_session(path, (6, 6), "cell.tif")
+    assert loaded.quality_of(1) == 4
+    assert loaded.quality_of(2) == 5
+
+
+def test_quality_is_saved_with_the_mask(tmp_path):
+    from cellannotator.segio import load_session, save_session
+
+    session = MaskSession.empty(4, 4, "cell.tif")
+    session.masks[1, 1] = 1
+    session.set_quality(1, 3)
+    path = tmp_path / "cell_seg.npy"
+    save_session(path, session)
+    loaded = load_session(path, (4, 4), "cell.tif")
+    assert loaded.quality_of(1) == 3
+    assert loaded.quality_of(2) == 0
 
 
 def test_erase_selected_cell_only():

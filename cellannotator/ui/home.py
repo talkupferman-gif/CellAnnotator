@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from cellannotator.icons import icon_path
+
 
 class Mark(QWidget):
     def __init__(self):
@@ -34,6 +36,18 @@ class Mark(QWidget):
         for origin in ((28, 26), (46, 34), (34, 48)):
             painter.drawEllipse(origin[0], origin[1], 14, 14)
         painter.end()
+
+
+def _logo() -> QLabel:
+    label = QLabel()
+    pixmap = QPixmap(str(icon_path()))
+    if pixmap.isNull():
+        label.setFixedSize(88, 88)
+        return label
+    label.setPixmap(pixmap.scaled(88, 88, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    label.setFixedSize(88, 88)
+    label.setAlignment(Qt.AlignCenter)
+    return label
 
 
 def _tile(locked: bool) -> QPixmap:
@@ -61,7 +75,7 @@ class HomePage(QWidget):
         layout.addStretch(1)
         row = QHBoxLayout()
         row.addStretch(1)
-        row.addWidget(Mark())
+        row.addWidget(_logo())
         row.addStretch(1)
         layout.addLayout(row)
         title = QLabel("CellAnnotator")
